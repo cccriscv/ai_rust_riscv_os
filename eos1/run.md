@@ -5,13 +5,13 @@
 (py310) cccimac@cccimacdeiMac eos1 % ./run.sh
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
 -----------------------------------
-   EOS with VirtIO Disk Driver     
+   EOS Refactored (v1.0)           
 -----------------------------------
-[Kernel] Mapping MMIO (UART + VirtIO)...
+[Kernel] Mapping MMIO (PLIC & VirtIO)...
 [Kernel] MMU Enabled.
-[Kernel] VirtIO Initialized.
-[OS] Jumping to User Mode...
-Shell initialized (VirtIO Enabled).
+[Kernel] Devices Initialized.
+[OS] System Ready. Switching to Shell...
+Shell initialized (Refactored).
 eos> ls
  - hello.txt
  - secret.txt
@@ -20,7 +20,7 @@ eos> cat hello.txt
 Hello! This is a text file stored in the Kernel.
 Rust OS is fun!
 eos> exec program.elf
-Loading program.elf with args ["program.elf"]...
+Loading program.elf...
 [Kernel] Spawning process with 1 args...
 [Kernel] ELF loaded.
 [Kernel] Process spawned with PID 2
