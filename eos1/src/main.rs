@@ -16,38 +16,27 @@ use alloc::string::String;
 
 use core::panic::PanicInfo;
 use core::fmt;
-use task::{Task, Context, STACK_SIZE};
+use task::{Task, Context, Scheduler}; 
 #[allow(unused_imports)]
 use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U, KERNEL_PAGE_TABLE};
 
 core::arch::global_asm!(include_str!("entry.S"));
 core::arch::global_asm!(include_str!("trap.S"));
 
-unsafe extern "C" {
-    fn trap_vector();
-}
+unsafe extern "C" { fn trap_vector(); }
 
-// --- 硬體常數: CLINT (Timer) ---
+// --- Hardware Constants ---
 const CLINT_MTIMECMP: *mut u64 = 0x0200_4000 as *mut u64;
 const CLINT_MTIME: *const u64 = 0x0200_BFF8 as *const u64;
-const INTERVAL: u64 = 5_000_000;
+const INTERVAL: u64 = 1_000_000;
 
-// --- 硬體常數: PLIC (Interrupt Controller) ---
 const PLIC_BASE: usize = 0x0c00_0000;
 const PLIC_PRIORITY: *mut u32 = PLIC_BASE as *mut u32;
 const PLIC_ENABLE: *mut u32 = (PLIC_BASE + 0x2000) as *mut u32;
 const PLIC_THRESHOLD: *mut u32 = (PLIC_BASE + 0x200000) as *mut u32;
 const PLIC_CLAIM: *mut u32 = (PLIC_BASE + 0x200004) as *mut u32;
 
-// --- 全域變數 ---
-static mut TASK1: Task = Task::new();
-static mut TASK2: Task = Task::new();
-static mut CTX1: Context = Context::empty();
-static mut CTX2: Context = Context::empty();
-static mut CURR_TASK: usize = 1;
-
-// --- 鍵盤緩衝區 (Ring Buffer) ---
-// [修正 1] 定義常數，避免對 static mut 使用 .len()
+// --- Keyboard Buffer ---
 const KEY_BUFFER_SIZE: usize = 256;
 static mut KEY_BUFFER: [u8; KEY_BUFFER_SIZE] = [0; KEY_BUFFER_SIZE];
 static mut KEY_HEAD: usize = 0;
@@ -55,27 +44,20 @@ static mut KEY_TAIL: usize = 0;
 
 fn push_key(c: u8) {
     unsafe {
-        // [修正 1] 使用常數 KEY_BUFFER_SIZE
         let next = (KEY_HEAD + 1) % KEY_BUFFER_SIZE;
-        if next != KEY_TAIL { 
-            KEY_BUFFER[KEY_HEAD] = c;
-            KEY_HEAD = next;
-        }
+        if next != KEY_TAIL { KEY_BUFFER[KEY_HEAD] = c; KEY_HEAD = next; }
     }
 }
-
 fn pop_key() -> Option<u8> {
     unsafe {
         if KEY_HEAD == KEY_TAIL { return None; }
         let c = KEY_BUFFER[KEY_TAIL];
-        // [修正 1] 使用常數 KEY_BUFFER_SIZE
         KEY_TAIL = (KEY_TAIL + 1) % KEY_BUFFER_SIZE;
         Some(c)
     }
 }
 
-// --- 初始化函式 ---
-
+// --- Initialization ---
 fn set_next_timer() {
     unsafe {
         let now = CLINT_MTIME.read_volatile();
@@ -85,19 +67,16 @@ fn set_next_timer() {
 
 fn init_plic() {
     unsafe {
-        // [修正 2] 使用原生指標呼叫 enable_interrupt，避免建立引用
         let writer = &raw mut uart::WRITER;
         (*writer).enable_interrupt();
-
         let irq_uart = 10; 
-
         PLIC_PRIORITY.add(irq_uart).write_volatile(1);
         PLIC_ENABLE.write_volatile(1 << irq_uart);
         PLIC_THRESHOLD.write_volatile(0);
     }
 }
 
-// --- Syscall ID & Wrappers ---
+// --- Syscalls ---
 const SYSCALL_PUTCHAR: u64 = 1;
 const SYSCALL_GETCHAR: u64 = 2;
 const SYSCALL_FILE_LEN: u64 = 3;
@@ -116,22 +95,20 @@ fn sys_exec(data: &[u8]) -> isize { let mut ret: isize; unsafe { core::arch::asm
 fn sys_exit(code: i32) -> ! { unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_EXIT, in("a0") code); } loop {} }
 
 struct UserOut;
-impl fmt::Write for UserOut {
-    fn write_str(&mut self, s: &str) -> fmt::Result { for c in s.bytes() { sys_putchar(c); } Ok(()) }
-}
+impl fmt::Write for UserOut { fn write_str(&mut self, s: &str) -> fmt::Result { for c in s.bytes() { sys_putchar(c); } Ok(()) } }
 #[macro_export]
 macro_rules! user_println { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w = UserOut; let _ = write!(w, $($arg)*); let _ = write!(w, "\n"); }); }
 #[macro_export]
 macro_rules! user_print { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w = UserOut; let _ = write!(w, $($arg)*); }); }
 
-// --- Shell Task ---
-fn task1() -> ! {
-    user_println!("Shell initialized (Interrupt Driven).");
+// --- Tasks ---
+
+extern "C" fn shell_entry() -> ! {
+    user_println!("Shell initialized (Scheduler V1).");
     let mut command = String::new();
     user_print!("eos> ");
 
     loop {
-        // 從 Buffer 讀取
         let c = sys_getchar();
         if c != 0 {
             if c == 13 || c == 10 {
@@ -178,6 +155,10 @@ fn task1() -> ! {
                                 }
                             }
                         },
+                        "panic" => {
+                            user_println!("Crashing on purpose...");
+                            unsafe { (0x0 as *mut u8).write_volatile(0); }
+                        },
                         _ => user_println!("Unknown: {}", parts[0]),
                     }
                 }
@@ -190,40 +171,25 @@ fn task1() -> ! {
     }
 }
 
-fn task2() -> ! {
+extern "C" fn bg_task() -> ! {
     loop { for _ in 0..5000000 {} }
 }
 
-// --- 中斷處理器集合 ---
+// --- Handlers ---
 
-// [修正 3] 將 ctx_ptr 改名為 _ctx_ptr 以消除未使用警告
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_timer(_ctx_ptr: *mut Context) -> *mut Context {
     set_next_timer();
-    unsafe {
-        let next_task = if CURR_TASK == 1 { CURR_TASK = 2; &raw mut TASK2 } else { CURR_TASK = 1; &raw mut TASK1 };
-        let next_ctx = if CURR_TASK == 1 { &raw mut CTX1 } else { &raw mut CTX2 };
-
-        let next_root_ppn = (*next_task).root_ppn;
-        let satp_val = if next_root_ppn != 0 {
-            (8 << 60) | next_root_ppn
-        } else {
-            let kernel_root = crate::mm::page_table::KERNEL_PAGE_TABLE as usize;
-            (8 << 60) | (kernel_root >> 12)
-        };
-        core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
-        return next_ctx;
-    }
+    let scheduler = task::get_scheduler();
+    unsafe { scheduler.schedule() }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_external(ctx_ptr: *mut Context) -> *mut Context {
     unsafe {
         let irq = PLIC_CLAIM.read_volatile();
-        if irq == 10 { // UART IRQ
-            while let Some(c) = uart::_getchar() {
-                push_key(c);
-            }
+        if irq == 10 { 
+            while let Some(c) = uart::_getchar() { push_key(c); }
         }
         PLIC_CLAIM.write_volatile(irq);
     }
@@ -234,7 +200,6 @@ pub extern "C" fn handle_external(ctx_ptr: *mut Context) -> *mut Context {
 pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
     let mcause: usize;
     unsafe { core::arch::asm!("csrr {}, mcause", out(reg) mcause); }
-    
     let is_interrupt = (mcause >> 63) != 0;
     let code = mcause & 0xfff;
 
@@ -281,31 +246,62 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                     },
                     SYSCALL_EXEC => {
                         let elf_data = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
-                        println!("[Kernel] Executing new process...");
+                        println!("[Kernel] Spawning new process...");
                         let new_table = mm::page_table::new_user_page_table();
                         if new_table.is_null() { (*ctx_ptr).regs[10] = (-1isize) as u64; }
                         else {
                             if let Some(entry) = elf::load_elf(elf_data, &mut *new_table) {
-                                println!("[Kernel] ELF loaded. Switching SATP.");
-                                if CURR_TASK == 1 { (*(&raw mut TASK1)).root_ppn = (new_table as usize) >> 12; }
-                                else { (*(&raw mut TASK2)).root_ppn = (new_table as usize) >> 12; }
-                                let satp_val = (8 << 60) | ((new_table as usize) >> 12);
-                                core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
-                                (*ctx_ptr).mepc = entry;
-                                return ctx_ptr;
+                                println!("[Kernel] ELF loaded.");
+                                
+                                // User Stack 分配
+                                let stack_frame = mm::frame::alloc_frame();
+                                let stack_vaddr = 0xF000_0000;
+                                
+                                // [修正] 移除多餘的 unsafe 區塊 (外層已經有了)
+                                mm::page_table::map(
+                                    &mut *new_table, 
+                                    stack_vaddr, 
+                                    stack_frame, 
+                                    PTE_U | PTE_R | PTE_W
+                                );
+
+                                let scheduler = task::get_scheduler();
+                                let new_pid = scheduler.tasks.len();
+                                let mut new_task = Task::new_user(new_pid);
+                                new_task.root_ppn = (new_table as usize) >> 12;
+                                new_task.context.mepc = entry;
+                                new_task.context.regs[2] = (stack_vaddr + 4096) as u64; // SP
+
+                                scheduler.spawn(new_task);
+                                println!("[Kernel] Process spawned with PID {}", new_pid);
+                                (*ctx_ptr).regs[10] = new_pid as u64;
                             } else { (*ctx_ptr).regs[10] = (-1isize) as u64; }
                         }
                     },
                     SYSCALL_EXIT => {
-                        println!("[Kernel] User App exited with code: {}", a0);
+                        // 這一行可以留著，除錯用，或者也拿掉讓畫面更乾淨
+                        // println!("[Kernel] Process exited code: {}", a0);
+
+                        // [關鍵修正] 移除已結束的任務
+                        let scheduler = task::get_scheduler();
+                        
+                        // 我們假設 Shell (id 0) 和 BG Task (id 1) 是永駐的
+                        // 所以我們把所有大於 2 的任務都砍掉
+                        // 這樣可以確保 Timer 中斷不會再排程到這個已死掉的任務
+                        if scheduler.tasks.len() > 2 {
+                            scheduler.tasks.truncate(2);
+                        }
+                        
+                        // 強制切換回 Shell (Task 0)
+                        // println!("Rebooting shell...");
+                        scheduler.current_index = 0;
+                        let shell_task = &mut scheduler.tasks[0];
+                        
+                        // 切換 SATP 回 Kernel/Shell 的空間
                         let kernel_root = crate::mm::page_table::KERNEL_PAGE_TABLE as usize;
-                        let satp_val = (8 << 60) | (kernel_root >> 12);
-                        core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
-                        if CURR_TASK == 1 { (*(&raw mut TASK1)).root_ppn = 0; }
-                        else { (*(&raw mut TASK2)).root_ppn = 0; }
-                        println!("Rebooting shell...");
-                        (*ctx_ptr).mepc = task1 as u64;
-                        return ctx_ptr;
+                        core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
+                        
+                        return &mut shell_task.context;
                     },
                     _ => println!("Unknown Syscall: {}", id),
                 }
@@ -317,26 +313,35 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
         let mtval: usize;
         unsafe { core::arch::asm!("csrr {}, mtval", out(reg) mtval); }
         println!("\n[Crash] mcause={}, mepc={:x}, mtval={:x}", code, unsafe { (*ctx_ptr).mepc }, mtval);
-        println!("Rebooting shell...");
+        println!("User App crashed. Rebooting shell...");
+        
         unsafe {
             let kernel_root = crate::mm::page_table::KERNEL_PAGE_TABLE as usize;
             core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
-            if CURR_TASK == 1 { (*(&raw mut TASK1)).root_ppn = 0; }
-            else { (*(&raw mut TASK2)).root_ppn = 0; }
-            (*ctx_ptr).mepc = task1 as u64;
+            
+            let scheduler = task::get_scheduler();
+            // [關鍵修正] 崩潰時同樣清理任務列表
+            if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
+            scheduler.current_index = 0;
+            let shell_task = &mut scheduler.tasks[0];
+            
+            shell_task.root_ppn = 0;
+            shell_task.context.mepc = shell_entry as u64;
+            
             let mut mstatus: usize;
             core::arch::asm!("csrr {}, mstatus", out(reg) mstatus);
             mstatus &= !(3 << 11); mstatus |= 1 << 7;
             core::arch::asm!("csrw mstatus, {}", in(reg) mstatus);
+            
+            return &mut shell_task.context;
         }
-        return ctx_ptr;
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> ! {
     println!("-----------------------------------");
-    println!("   EOS with PLIC Interrupts        ");
+    println!("   EOS with Round-Robin Scheduler  ");
     println!("-----------------------------------");
 
     unsafe {
@@ -344,8 +349,7 @@ pub extern "C" fn rust_main() -> ! {
         core::arch::asm!("csrw pmpcfg0, {}", in(reg) 0x1Fusize);
 
         mm::frame::init();
-        println!("[Kernel] Frame Allocator initialized.");
-
+        
         let root_ptr = mm::frame::alloc_frame() as *mut PageTable;
         let root = &mut *root_ptr;
         mm::page_table::KERNEL_PAGE_TABLE = root_ptr;
@@ -353,35 +357,32 @@ pub extern "C" fn rust_main() -> ! {
         mm::page_table::map(root, 0x1000_0000, 0x1000_0000, PTE_R | PTE_W);
         let mut addr = 0x0200_0000;
         while addr < 0x0200_FFFF { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
-        
-        println!("[Kernel] Mapping PLIC...");
         let mut addr = 0x0C00_0000;
         let end_plic = 0x0C20_1000; 
-        while addr < end_plic {
-            mm::page_table::map(root, addr, addr, PTE_R | PTE_W);
-            addr += 4096;
-        }
+        while addr < end_plic { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
         
-        let start = 0x8000_0000; let end = 0x8040_0000; 
+        let start = 0x8000_0000; let end = 0x8800_0000; 
         let mut addr = start;
-        while addr < end { mm::page_table::map(root, addr, addr, PTE_R | PTE_W | PTE_X | PTE_U); addr += 4096; }
+        while addr < end { 
+            mm::page_table::map(root, addr, addr, PTE_R | PTE_W | PTE_X | PTE_U); 
+            addr += 4096; 
+        }
 
         let satp_val = (8 << 60) | ((root_ptr as usize) >> 12);
         core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
         println!("[Kernel] MMU Enabled.");
 
-        let stack1_top = (&raw mut TASK1.stack as usize) + STACK_SIZE;
-        CTX1.regs[2] = stack1_top as u64; CTX1.mepc = task1 as u64;
-        (*(&raw mut TASK1)).root_ppn = 0; 
-        let stack2_top = (&raw mut TASK2.stack as usize) + STACK_SIZE;
-        CTX2.regs[2] = stack2_top as u64; CTX2.mepc = task2 as u64;
-        (*(&raw mut TASK2)).root_ppn = 0;
+        Scheduler::init();
+        let scheduler = task::get_scheduler();
+        scheduler.spawn(Task::new_kernel(0, shell_entry));
+        scheduler.spawn(Task::new_kernel(1, bg_task));
+        println!("[Kernel] Tasks spawned.");
 
         init_plic();
-        println!("[Kernel] PLIC Initialized.");
-
         core::arch::asm!("csrw mtvec, {}", in(reg) (trap_vector as usize) | 1);
-        core::arch::asm!("csrw mscratch, {}", in(reg) &raw mut CTX1);
+        
+        let first_task = &mut scheduler.tasks[0];
+        core::arch::asm!("csrw mscratch, {}", in(reg) &mut first_task.context);
         
         let mstatus: usize = (0 << 11) | (1 << 7) | (1 << 13);
         core::arch::asm!("csrw mstatus, {}", in(reg) mstatus);
@@ -389,8 +390,15 @@ pub extern "C" fn rust_main() -> ! {
         set_next_timer();
         core::arch::asm!("csrrs zero, mie, {}", in(reg) (1 << 11) | (1 << 7));
 
-        println!("[OS] Jumping to User Mode...");
-        core::arch::asm!("mv sp, {}", "csrw mepc, {}", "mret", in(reg) CTX1.regs[2], in(reg) CTX1.mepc);
+        println!("[OS] Starting Scheduler...");
+        
+        core::arch::asm!(
+            "mv sp, {}",
+            "csrw mepc, {}",
+            "mret",
+            in(reg) first_task.context.regs[2],
+            in(reg) first_task.context.mepc
+        );
     }
     loop {}
 }

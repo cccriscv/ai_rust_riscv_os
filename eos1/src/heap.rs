@@ -1,7 +1,8 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
-const HEAP_SIZE: usize = 64 * 1024;
+// [修正] 加大 Heap 到 1MB
+const HEAP_SIZE: usize = 1024 * 1024; 
 
 static mut HEAP_MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 static mut HEAP_INDEX: usize = 0;
@@ -13,10 +14,7 @@ unsafe impl GlobalAlloc for SimpleAllocator {
         let align = layout.align();
         let size = layout.size();
         
-        // [修正] 取得起始位址
         let start_addr = &raw mut HEAP_MEMORY as usize;
-        
-        // [修正] 讀取 HEAP_INDEX 必須包在 unsafe 區塊
         let mut index = unsafe { HEAP_INDEX };
         
         let mut current_addr = start_addr + index;
@@ -32,7 +30,6 @@ unsafe impl GlobalAlloc for SimpleAllocator {
             return null_mut();
         }
 
-        // [修正] 寫入 HEAP_INDEX 必須包在 unsafe 區塊
         unsafe {
             HEAP_INDEX = index + size;
         }

@@ -1,8 +1,7 @@
 .section .text.entry
     .globl _start
 _start:
-    # 設定堆疊指標，我們暫時隨便找個高位址
-    # QEMU 預設有 128MB RAM，所以 0x81000000 是安全的
+    # 設定堆疊指標
     la sp, _stack_top
     call rust_main
 
@@ -11,5 +10,7 @@ loop:
 
     .section .bss
     .align 4
-    .space 4096 * 4 # 16KB 的堆疊空間
+    # [修正] 加大堆疊空間防止 Stack Overflow
+    # 4096 * 32 = 128KB (足夠安全了)
+    .space 4096 * 32 
 _stack_top:
