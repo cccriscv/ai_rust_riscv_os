@@ -25,6 +25,7 @@ core::arch::global_asm!(include_str!("trap.S"));
 
 unsafe extern "C" { fn trap_vector(); }
 
+// --- Hardware Constants ---
 const CLINT_MTIMECMP: *mut u64 = 0x0200_4000 as *mut u64;
 const CLINT_MTIME: *const u64 = 0x0200_BFF8 as *const u64;
 const INTERVAL: u64 = 1_000_000;
@@ -35,6 +36,7 @@ const PLIC_ENABLE: *mut u32 = (PLIC_BASE + 0x2000) as *mut u32;
 const PLIC_THRESHOLD: *mut u32 = (PLIC_BASE + 0x200000) as *mut u32;
 const PLIC_CLAIM: *mut u32 = (PLIC_BASE + 0x200004) as *mut u32;
 
+// --- Keyboard Buffer ---
 const KEY_BUFFER_SIZE: usize = 256;
 static mut KEY_BUFFER: [u8; KEY_BUFFER_SIZE] = [0; KEY_BUFFER_SIZE];
 static mut KEY_HEAD: usize = 0;
@@ -55,6 +57,7 @@ fn pop_key() -> Option<u8> {
     }
 }
 
+// --- Initialization ---
 fn set_next_timer() {
     unsafe {
         let now = CLINT_MTIME.read_volatile();
@@ -73,6 +76,7 @@ fn init_plic() {
     }
 }
 
+// --- Syscalls ---
 const SYSCALL_PUTCHAR: u64 = 1;
 const SYSCALL_GETCHAR: u64 = 2;
 const SYSCALL_FILE_LEN: u64 = 3;
@@ -86,7 +90,22 @@ fn sys_getchar() -> u8 { let mut ret: usize; unsafe { core::arch::asm!("ecall", 
 fn sys_file_len(name: &str) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_LEN, in("a0") name.as_ptr(), in("a1") name.len(), lateout("a0") ret); } ret }
 fn sys_file_read(name: &str, buf: &mut [u8]) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_READ, in("a0") name.as_ptr(), in("a1") name.len(), in("a2") buf.as_mut_ptr(), in("a3") buf.len(), lateout("a0") ret); } ret }
 fn sys_file_list(index: usize, buf: &mut [u8]) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_LIST, in("a0") index, in("a1") buf.as_mut_ptr(), in("a2") buf.len(), lateout("a0") ret); } ret }
-fn sys_exec(data: &[u8]) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_EXEC, in("a0") data.as_ptr(), in("a1") data.len(), lateout("a0") ret); } ret }
+// [Exec Wrapper]: 傳遞 4 個參數 (elf_data, elf_len, argv_ptr, argv_len)
+fn sys_exec(data: &[u8], argv: &[&str]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYSCALL_EXEC,
+            in("a0") data.as_ptr(),
+            in("a1") data.len(),
+            in("a2") argv.as_ptr(), // argv (pointer to &str array)
+            in("a3") argv.len(),    // argc
+            lateout("a0") ret,
+        );
+    }
+    ret
+}
 #[allow(dead_code)]
 fn sys_exit(code: i32) -> ! { unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_EXIT, in("a0") code); } loop {} }
 
@@ -97,10 +116,11 @@ macro_rules! user_println { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w 
 #[macro_export]
 macro_rules! user_print { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w = UserOut; let _ = write!(w, $($arg)*); }); }
 
-// --- Tasks ---
+// --- Tasks (Shell & Background) ---
 
+// [關鍵] 這就是之前遺失的 shell_entry 函式定義
 extern "C" fn shell_entry() -> ! {
-    user_println!("Shell initialized (GC Heap Enabled).");
+    user_println!("Shell initialized (Args Enabled).");
     let mut command = String::new();
     user_print!("eos> ");
 
@@ -111,9 +131,10 @@ extern "C" fn shell_entry() -> ! {
                 user_println!("");
                 let cmd_line = command.trim();
                 let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+                
                 if !parts.is_empty() {
                     match parts[0] {
-                        "help" => user_println!("ls, cat <file>, exec <file>, memtest, panic"),
+                        "help" => user_println!("ls, cat <file>, exec <file> [args...], panic"),
                         "ls" => {
                             let mut idx = 0; let mut buf = [0u8; 32];
                             loop {
@@ -138,34 +159,35 @@ extern "C" fn shell_entry() -> ! {
                             }
                         },
                         "exec" => {
-                            if parts.len() < 2 { user_println!("Usage: exec <file>"); }
-                            else {
+                            if parts.len() < 2 {
+                                user_println!("Usage: exec <file> [args...]");
+                            } else {
                                 let fname = parts[1];
                                 let len = sys_file_len(fname);
-                                if len < 0 { user_println!("File not found."); }
-                                else {
+                                if len < 0 {
+                                    user_println!("File not found.");
+                                } else {
                                     let mut elf_data = vec![0u8; len as usize];
                                     sys_file_read(fname, &mut elf_data);
-                                    user_println!("Loading {}...", fname);
-                                    sys_exec(&elf_data);
+                                    
+                                    // 參數處理: 切片 parts[1..]
+                                    let args = &parts[1..];
+                                    
+                                    user_println!("Loading {} with args {:?}...", fname, args);
+                                    sys_exec(&elf_data, args);
                                 }
                             }
                         },
-                        // 記憶體回收測試
                         "memtest" => {
-                            user_println!("Running Memory Stress Test (10000 allocs)...");
+                            user_println!("Running Memory Stress Test...");
                             for i in 0..10000 {
-                                let mut v = Vec::new();
-                                v.push(i);
-                                let s = alloc::format!("Iter {}", i);
-                                if i % 1000 == 0 {
-                                    user_println!("  - {} (vec len: {})", s, v.len());
-                                }
+                                let mut v = Vec::new(); v.push(i);
+                                if i % 1000 == 0 { user_println!("Iter {}", i); }
                             }
-                            user_println!("Test passed! Memory is recycled.");
+                            user_println!("Done.");
                         },
                         "panic" => {
-                            user_println!("Crashing on purpose...");
+                            user_println!("Crashing...");
                             unsafe { (0x0 as *mut u8).write_volatile(0); }
                         },
                         _ => user_println!("Unknown: {}", parts[0]),
@@ -180,9 +202,12 @@ extern "C" fn shell_entry() -> ! {
     }
 }
 
+// 這也是之前可能遺失的 bg_task
 extern "C" fn bg_task() -> ! {
     loop { for _ in 0..5000000 {} }
 }
+
+// --- Handlers ---
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_timer(_ctx_ptr: *mut Context) -> *mut Context {
@@ -253,7 +278,14 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                     },
                     SYSCALL_EXEC => {
                         let elf_data = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
-                        println!("[Kernel] Spawning new process...");
+                        
+                        // [讀取參數]
+                        let argv_ptr = a2 as *const &str;
+                        let argc = a3 as usize;
+                        let argv_slice = core::slice::from_raw_parts(argv_ptr, argc);
+
+                        println!("[Kernel] Spawning process with {} args...", argc);
+
                         let new_table = mm::page_table::new_user_page_table();
                         if new_table.is_null() { (*ctx_ptr).regs[10] = (-1isize) as u64; }
                         else {
@@ -264,12 +296,42 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                                 let stack_vaddr = 0xF000_0000;
                                 mm::page_table::map(&mut *new_table, stack_vaddr, stack_frame, PTE_U | PTE_R | PTE_W);
 
+                                // [推送參數到 User Stack]
+                                let stack_top_paddr = stack_frame + 4096;
+                                let mut sp_paddr = stack_top_paddr;
+                                let mut str_vaddrs = Vec::new();
+                                
+                                for arg in argv_slice {
+                                    let bytes = arg.as_bytes();
+                                    let len = bytes.len() + 1; 
+                                    sp_paddr -= len;
+                                    let dest = sp_paddr as *mut u8;
+                                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
+                                    *dest.add(bytes.len()) = 0; 
+                                    str_vaddrs.push(stack_vaddr + (sp_paddr - stack_frame));
+                                }
+
+                                sp_paddr -= sp_paddr % 8; // Align
+                                sp_paddr -= (str_vaddrs.len() + 1) * 8; // Pointers array
+                                let argv_vaddr = stack_vaddr + (sp_paddr - stack_frame);
+                                let ptr_array = sp_paddr as *mut usize;
+                                for (i, vaddr) in str_vaddrs.iter().enumerate() {
+                                    *ptr_array.add(i) = *vaddr;
+                                }
+                                *ptr_array.add(str_vaddrs.len()) = 0; 
+
+                                let sp_vaddr = stack_vaddr + (sp_paddr - stack_frame);
+
                                 let scheduler = task::get_scheduler();
                                 let new_pid = scheduler.tasks.len();
                                 let mut new_task = Task::new_user(new_pid);
                                 new_task.root_ppn = (new_table as usize) >> 12;
                                 new_task.context.mepc = entry;
-                                new_task.context.regs[2] = (stack_vaddr + 4096) as u64; 
+                                new_task.context.regs[2] = sp_vaddr as u64; // SP
+                                
+                                // 設定 argc, argv
+                                new_task.context.regs[10] = argc as u64;
+                                new_task.context.regs[11] = argv_vaddr as u64;
 
                                 scheduler.spawn(new_task);
                                 println!("[Kernel] Process spawned with PID {}", new_pid);
@@ -294,28 +356,27 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
             }
         }
         
+        // Crash Handling
         let mtval: usize;
         unsafe { core::arch::asm!("csrr {}, mtval", out(reg) mtval); }
         println!("\n[Crash] mcause={}, mepc={:x}, mtval={:x}", code, unsafe { (*ctx_ptr).mepc }, mtval);
         println!("User App crashed. Rebooting shell...");
-        
         unsafe {
             let kernel_root = crate::mm::page_table::KERNEL_PAGE_TABLE as usize;
             core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
-            
             let scheduler = task::get_scheduler();
             if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
             scheduler.current_index = 0;
             let shell_task = &mut scheduler.tasks[0];
             
+            // 重置 Shell
             shell_task.root_ppn = 0;
-            shell_task.context.mepc = shell_entry as u64;
+            shell_task.context.mepc = shell_entry as u64; // 使用 shell_entry
             
             let mut mstatus: usize;
             core::arch::asm!("csrr {}, mstatus", out(reg) mstatus);
             mstatus &= !(3 << 11); mstatus |= 1 << 7;
             core::arch::asm!("csrw mstatus, {}", in(reg) mstatus);
-            
             return &mut shell_task.context;
         }
     }
@@ -324,7 +385,7 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> ! {
     println!("-----------------------------------");
-    println!("   EOS with Round-Robin Scheduler  ");
+    println!("   EOS with Args Support           ");
     println!("-----------------------------------");
 
     unsafe {
@@ -332,10 +393,8 @@ pub extern "C" fn rust_main() -> ! {
         core::arch::asm!("csrw pmpcfg0, {}", in(reg) 0x1Fusize);
 
         mm::frame::init();
-        
         heap::init();
-        println!("[Kernel] Heap Allocator initialized.");
-
+        
         let root_ptr = mm::frame::alloc_frame() as *mut PageTable;
         let root = &mut *root_ptr;
         mm::page_table::KERNEL_PAGE_TABLE = root_ptr;
@@ -346,13 +405,9 @@ pub extern "C" fn rust_main() -> ! {
         let mut addr = 0x0C00_0000;
         let end_plic = 0x0C20_1000; 
         while addr < end_plic { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
-        
         let start = 0x8000_0000; let end = 0x8800_0000; 
         let mut addr = start;
-        while addr < end { 
-            mm::page_table::map(root, addr, addr, PTE_R | PTE_W | PTE_X | PTE_U); 
-            addr += 4096; 
-        }
+        while addr < end { mm::page_table::map(root, addr, addr, PTE_R | PTE_W | PTE_X | PTE_U); addr += 4096; }
 
         let satp_val = (8 << 60) | ((root_ptr as usize) >> 12);
         core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
@@ -362,29 +417,18 @@ pub extern "C" fn rust_main() -> ! {
         let scheduler = task::get_scheduler();
         scheduler.spawn(Task::new_kernel(0, shell_entry));
         scheduler.spawn(Task::new_kernel(1, bg_task));
-        println!("[Kernel] Tasks spawned.");
 
         init_plic();
         core::arch::asm!("csrw mtvec, {}", in(reg) (trap_vector as usize) | 1);
-        
         let first_task = &mut scheduler.tasks[0];
         core::arch::asm!("csrw mscratch, {}", in(reg) &mut first_task.context);
-        
         let mstatus: usize = (0 << 11) | (1 << 7) | (1 << 13);
         core::arch::asm!("csrw mstatus, {}", in(reg) mstatus);
-        
         set_next_timer();
         core::arch::asm!("csrrs zero, mie, {}", in(reg) (1 << 11) | (1 << 7));
 
-        println!("[OS] Starting Scheduler...");
-        
-        core::arch::asm!(
-            "mv sp, {}",
-            "csrw mepc, {}",
-            "mret",
-            in(reg) first_task.context.regs[2],
-            in(reg) first_task.context.mepc
-        );
+        println!("[OS] Jumping to User Mode...");
+        core::arch::asm!("mv sp, {}", "csrw mepc, {}", "mret", in(reg) first_task.context.regs[2], in(reg) first_task.context.mepc);
     }
     loop {}
 }
