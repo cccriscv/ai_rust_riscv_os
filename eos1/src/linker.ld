@@ -3,11 +3,10 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* QEMU RISC-V virt 機器從 0x80000000 開始 */
     . = 0x80000000;
 
     .text : {
-        *(.text.entry) /* 確保啟動程式碼放在最前面 */
+        *(.text.entry)
         *(.text .text.*)
     }
 
@@ -23,7 +22,8 @@ SECTIONS
         *(.bss .bss.*)
     }
 
-    /DISCARD/ : {
-        *(.eh_frame)
-    }
+    /* [新增] 定義核心結束的位址符號 */
+    /* 透過 ALIGN(4096) 確保它是從下一個 4KB 邊界開始 */
+    . = ALIGN(4096);
+    ekernel = .;
 }

@@ -15,6 +15,19 @@ fn sys_putchar(c: u8) {
     }
 }
 
+const SYSCALL_EXIT: u64 = 93; // Linux 的 exit 號碼通常是 93
+
+fn sys_exit(code: i32) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYSCALL_EXIT,
+            in("a0") code,
+        );
+    }
+    loop {} // 不會執行到這裡
+}
+
 struct Console;
 impl core::fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -23,7 +36,6 @@ impl core::fmt::Write for Console {
     }
 }
 
-// [修正 1] 新版 Rust 要求 linker 相關屬性必須標記 unsafe
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
@@ -31,12 +43,15 @@ pub extern "C" fn _start() -> ! {
     let mut out = Console;
 
     let _ = write!(out, "\n[UserApp] Hello, World!\n");
-    let _ = write!(out, "[UserApp] I am running at 0x80200000\n");
+    
+    // [修正] 更新這行文字，或者我們用點小技巧印出函式指標位址
+    let pc = _start as usize; 
+    let _ = write!(out, "[UserApp] I am running at 0x{:x}\n", pc);
+    
     let _ = write!(out, "[UserApp] Calculation: 10 + 20 = {}\n", 10 + 20);
 
-    // 觸發非法指令結束程式
-    unsafe { core::arch::asm!("unimp"); }
-    loop {}
+    // [修正] 改用 sys_exit 優雅退出
+    sys_exit(0);
 }
 
 #[panic_handler]
