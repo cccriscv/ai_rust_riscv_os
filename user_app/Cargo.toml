@@ -3,10 +3,8 @@ name = "user_app"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[lib]
+name = "ulib"  # 我們把共用庫取名叫 ulib (User Library)
+path = "src/lib.rs"
 
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = "z"  # 最佳化大小
-strip = true     # 移除符號表
+[dependencies]

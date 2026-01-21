@@ -1,3 +1,4 @@
+set -x
 cd user_app
 ./build.sh
 cd ../mkfs
