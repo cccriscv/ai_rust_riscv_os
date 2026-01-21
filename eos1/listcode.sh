@@ -1,0 +1,1 @@
+echo "--- src/task.rs ---"; cat src/task.rs; echo "--- src/trap.S ---"; cat src/trap.S; echo "--- src/main.rs ---"; cat src/main.rs; echo "--- src/entry.S ---"; cat src/entry.S; echo "--- src/linker.ld ---"; cat src/linker.ld
