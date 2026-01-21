@@ -1,34 +1,29 @@
 
 ```
 (py310) cccimac@cccimacdeiMac eos1 % cargo build
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+   Compiling eos1 v0.1.0 (/Users/cccimac/Desktop/ccc/cpu2os/02-系統程式/_rust/os/eos1/eos1)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.78s
 (py310) cccimac@cccimacdeiMac eos1 % ./run.sh
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
 -----------------------------------
-   EOS Refactored (v1.0)           
+   EOS with Round-Robin Scheduler  
 -----------------------------------
-[Kernel] Mapping MMIO (PLIC & VirtIO)...
 [Kernel] MMU Enabled.
-[Kernel] Devices Initialized.
-[OS] System Ready. Switching to Shell...
-Shell initialized (Refactored).
+[Kernel] Tasks spawned.
+[OS] Starting Scheduler...
+Shell initialized (Scheduler V1).
 eos> ls
  - hello.txt
  - secret.txt
  - program.elf
-eos> cat hello.txt
-Hello! This is a text file stored in the Kernel.
-Rust OS is fun!
 eos> exec program.elf
 Loading program.elf...
-[Kernel] Spawning process with 1 args...
+[Kernel] Spawning new process...
 [Kernel] ELF loaded.
 [Kernel] Process spawned with PID 2
 eos> 
-[UserApp] Started!
-[UserApp] argc = 1
-[UserApp] argv[0] = "program.elf"
-[Kernel] Process exited code: 0
+[UserApp] Hello, World!
+[UserApp] I am running at 0x10000
+[UserApp] Calculation: 10 + 20 = 30
 ls
  - hello.txt
  - secret.txt

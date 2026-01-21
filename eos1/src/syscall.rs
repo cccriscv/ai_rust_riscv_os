@@ -13,6 +13,7 @@ pub const GETCHAR: u64 = 2;
 pub const FILE_LEN: u64 = 3;
 pub const FILE_READ: u64 = 4;
 pub const FILE_LIST: u64 = 5;
+pub const FILE_WRITE: u64 = 8; // 注意：確認這 ID 沒有跟其他衝突
 pub const EXEC: u64 = 6;
 pub const DISK_READ: u64 = 7;
 pub const EXIT: u64 = 93;
@@ -47,6 +48,23 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                     user_buf[..len].copy_from_slice(&data[..len]);
                     ctx.regs[10] = len as u64;
                 } else { ctx.regs[10] = (-1isize) as u64; }
+            }
+        },
+        FILE_WRITE => {
+            unsafe {
+                let name_ptr = a0 as *const u8;
+                let name_len = a1 as usize;
+                let data_ptr = a2 as *const u8;
+                let data_len = a3 as usize;
+
+                let name_slice = core::slice::from_raw_parts(name_ptr, name_len);
+                let fname = core::str::from_utf8(name_slice).unwrap_or("");
+                
+                let data_slice = core::slice::from_raw_parts(data_ptr, data_len);
+
+                // 呼叫 FS 寫入
+                let ret = fs::write_file(fname, data_slice);
+                ctx.regs[10] = ret as u64;
             }
         },
         FILE_LIST => {

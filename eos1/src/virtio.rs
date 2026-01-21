@@ -22,6 +22,7 @@ const STATUS_DRIVER: u32 = 2;
 const STATUS_FEATURES_OK: u32 = 8;
 const STATUS_DRIVER_OK: u32 = 4;
 
+
 // --- Virtqueue 結構 ---
 #[repr(C)]
 struct VirtqDesc {
@@ -67,6 +68,7 @@ static mut USED_IDX: u16 = 0;
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 const VIRTIO_BLK_T_IN: u32 = 0;  // Read
+const VIRTIO_BLK_T_OUT: u32 = 1; // Write
 
 #[repr(C)]
 struct VirtioBlkReq {
@@ -175,4 +177,64 @@ pub fn read_disk(sector: u64) -> [u8; 512] {
     }
 
     buffer
+}
+
+// [新增] 寫入磁碟的一個 Sector (512 bytes)
+pub fn write_disk(sector: u64, data: &[u8]) {
+    if data.len() != 512 { panic!("Write size must be 512 bytes"); }
+
+    unsafe {
+        let base = VIRTIO0 as *mut u32;
+        let desc_table = QUEUE_PAGE as *mut VirtqDesc;
+        let avail_ring = (QUEUE_PAGE + 512) as *mut VirtqAvail;
+        let used_ring = (QUEUE_PAGE + 4096) as *mut VirtqUsed;
+
+        // 1. Request Header
+        static mut REQ_WRITE: VirtioBlkReq = VirtioBlkReq {
+            type_: VIRTIO_BLK_T_OUT, // 注意：這裡是 OUT
+            reserved: 0,
+            sector: 0,
+        };
+        REQ_WRITE.sector = sector;
+
+        // 2. Status Byte
+        static mut STATUS_BYTE_WRITE: u8 = 255;
+        STATUS_BYTE_WRITE = 255;
+
+        // 3. Fill Descriptors
+        // Desc 0: Header (Read-only for device)
+        (*desc_table.add(0)).addr = &raw mut REQ_WRITE as u64;
+        (*desc_table.add(0)).len = size_of::<VirtioBlkReq>() as u32;
+        (*desc_table.add(0)).flags = VRING_DESC_F_NEXT;
+        (*desc_table.add(0)).next = 1;
+
+        // Desc 1: Buffer (Read-only for device -> Device reads from RAM to Disk)
+        // [關鍵差異] 這裡 *不要* 加 VRING_DESC_F_WRITE，因為是裝置要讀資料
+        (*desc_table.add(1)).addr = data.as_ptr() as u64;
+        (*desc_table.add(1)).len = 512;
+        (*desc_table.add(1)).flags = VRING_DESC_F_NEXT; // 沒有 WRITE flag
+        (*desc_table.add(1)).next = 2;
+
+        // Desc 2: Status (Write-only for device)
+        (*desc_table.add(2)).addr = &raw mut STATUS_BYTE_WRITE as u64;
+        (*desc_table.add(2)).len = 1;
+        (*desc_table.add(2)).flags = VRING_DESC_F_WRITE;
+        (*desc_table.add(2)).next = 0;
+
+        // 4. Update Available Ring
+        let idx = (*avail_ring).idx as usize;
+        (*avail_ring).ring[idx % 32] = 0; // Head Index
+        
+        core::arch::asm!("fence");
+        (*avail_ring).idx = (*avail_ring).idx.wrapping_add(1);
+
+        // 5. Notify Device
+        base.add(QUEUE_NOTIFY / 4).write_volatile(0);
+
+        // 6. Wait for completion
+        while (*used_ring).idx == USED_IDX {
+            core::arch::asm!("nop");
+        }
+        USED_IDX = (*used_ring).idx;
+    }
 }
