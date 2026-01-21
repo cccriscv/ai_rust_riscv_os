@@ -78,6 +78,12 @@ fn sys_file_write(name: &str, data: &[u8]) -> isize {
     ret
 }
 
+fn sys_chdir(name: &str) -> isize { 
+    let mut ret: isize; 
+    unsafe { core::arch::asm!("ecall", in("a7") CHDIR, in("a0") name.as_ptr(), in("a1") name.len(), lateout("a0") ret); } 
+    ret 
+}
+
 // --- Output Helpers ---
 
 struct UserOut;
@@ -166,7 +172,14 @@ pub extern "C" fn shell_entry() -> ! {
                                 }
                             }
                         },
-
+                        "cd" => {
+                            if parts.len() < 2 { user_println!("Usage: cd <dir>"); }
+                            else {
+                                let ret = sys_chdir(parts[1]);
+                                if ret == 0 { user_println!("Changed directory."); }
+                                else { user_println!("Directory not found."); }
+                            }
+                        },
                         // [新增] 寫入指令
                         "write" => {
                             if parts.len() < 3 {

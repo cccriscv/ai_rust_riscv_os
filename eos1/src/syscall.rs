@@ -14,6 +14,7 @@ pub const FILE_LEN: u64 = 3;
 pub const FILE_READ: u64 = 4;
 pub const FILE_LIST: u64 = 5;
 pub const FILE_WRITE: u64 = 8; // 注意：確認這 ID 沒有跟其他衝突
+pub const CHDIR: u64 = 9;
 pub const EXEC: u64 = 6;
 pub const DISK_READ: u64 = 7;
 pub const EXIT: u64 = 93;
@@ -67,20 +68,39 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                 ctx.regs[10] = ret as u64;
             }
         },
-        FILE_LIST => {
-            // [修正] 包裹 unsafe
+// dispatcher match 內新增
+        CHDIR => {
             unsafe {
-                let user_buf = core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize);
-                let files = fs::list_files();
-                if (a0 as usize) < files.len() {
-                    let fname = files[a0 as usize].as_bytes();
-                    let len = core::cmp::min(fname.len(), user_buf.len());
-                    user_buf[..len].copy_from_slice(&fname[..len]);
-                    ctx.regs[10] = len as u64;
-                } else { ctx.regs[10] = (-1isize) as u64; }
+                let slice = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
+                let fname = core::str::from_utf8(slice).unwrap_or("");
+                let ret = fs::change_dir(fname);
+                ctx.regs[10] = ret as u64;
             }
         },
         
+// 修改 FILE_LIST，因為現在回傳 (Type, Name) 而不是只回傳 Name
+// 這邊為了相容舊的 shell ls，我們暫時只把 name 填回去，
+// 或者我們可以讓 ls 顯示 [DIR] 前綴
+        FILE_LIST => {
+            unsafe {
+                let user_buf = core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize);
+                let files = fs::list_files(); // 這是 Vec<(u8, String)>
+                if (a0 as usize) < files.len() {
+                    let (ftype, name) = &files[a0 as usize];
+                    // 格式化字串：如果是目錄加 "/"
+                    let display_name = if *ftype == 1 { 
+                        alloc::format!("{}/", name) 
+                    } else { 
+                        alloc::format!("{}", name) 
+                    };
+                    
+                    let bytes = display_name.as_bytes();
+                    let len = core::cmp::min(bytes.len(), user_buf.len());
+                    user_buf[..len].copy_from_slice(&bytes[..len]);
+                    ctx.regs[10] = len as u64;
+                } else { ctx.regs[10] = (-1isize) as u64; }
+            }
+        },        
         EXEC => {
             // [修正] 包裹 unsafe
             unsafe {
