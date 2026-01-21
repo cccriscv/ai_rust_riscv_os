@@ -8,6 +8,7 @@ mod heap;
 mod fs;
 mod elf;
 mod mm;
+mod virtio; // [新增] 引入 VirtIO 模組
 
 #[macro_use]
 extern crate alloc;
@@ -83,6 +84,7 @@ const SYSCALL_FILE_LEN: u64 = 3;
 const SYSCALL_FILE_READ: u64 = 4;
 const SYSCALL_FILE_LIST: u64 = 5;
 const SYSCALL_EXEC: u64 = 6;
+const SYSCALL_DISK_READ: u64 = 7; // [新增]
 const SYSCALL_EXIT: u64 = 93;
 
 fn sys_putchar(c: u8) { unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_PUTCHAR, in("a0") c); } }
@@ -90,22 +92,34 @@ fn sys_getchar() -> u8 { let mut ret: usize; unsafe { core::arch::asm!("ecall", 
 fn sys_file_len(name: &str) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_LEN, in("a0") name.as_ptr(), in("a1") name.len(), lateout("a0") ret); } ret }
 fn sys_file_read(name: &str, buf: &mut [u8]) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_READ, in("a0") name.as_ptr(), in("a1") name.len(), in("a2") buf.as_mut_ptr(), in("a3") buf.len(), lateout("a0") ret); } ret }
 fn sys_file_list(index: usize, buf: &mut [u8]) -> isize { let mut ret: isize; unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_LIST, in("a0") index, in("a1") buf.as_mut_ptr(), in("a2") buf.len(), lateout("a0") ret); } ret }
-// [Exec Wrapper]: 傳遞 4 個參數 (elf_data, elf_len, argv_ptr, argv_len)
-fn sys_exec(data: &[u8], argv: &[&str]) -> isize {
-    let mut ret: isize;
+fn sys_exec(data: &[u8], argv: &[&str]) -> isize { 
+    let mut ret: isize; 
+    unsafe { 
+        core::arch::asm!(
+            "ecall", 
+            in("a7") SYSCALL_EXEC, 
+            in("a0") data.as_ptr(), 
+            in("a1") data.len(), 
+            in("a2") argv.as_ptr(), 
+            in("a3") argv.len(), 
+            lateout("a0") ret
+        ); 
+    } 
+    ret 
+}
+// [新增] 磁碟讀取 Wrapper
+fn sys_disk_read(sector: u64, buf: &mut [u8]) {
     unsafe {
         core::arch::asm!(
             "ecall",
-            in("a7") SYSCALL_EXEC,
-            in("a0") data.as_ptr(),
-            in("a1") data.len(),
-            in("a2") argv.as_ptr(), // argv (pointer to &str array)
-            in("a3") argv.len(),    // argc
-            lateout("a0") ret,
+            in("a7") SYSCALL_DISK_READ,
+            in("a0") sector,
+            in("a1") buf.as_mut_ptr(),
+            in("a2") buf.len(),
         );
     }
-    ret
 }
+
 #[allow(dead_code)]
 fn sys_exit(code: i32) -> ! { unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_EXIT, in("a0") code); } loop {} }
 
@@ -116,11 +130,23 @@ macro_rules! user_println { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w 
 #[macro_export]
 macro_rules! user_print { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w = UserOut; let _ = write!(w, $($arg)*); }); }
 
-// --- Tasks (Shell & Background) ---
+// --- Shell Helper ---
+fn parse_int(s: &str) -> Option<u64> {
+    let mut res: u64 = 0;
+    for c in s.bytes() {
+        if c >= b'0' && c <= b'9' {
+            res = res * 10 + (c - b'0') as u64;
+        } else {
+            return None;
+        }
+    }
+    Some(res)
+}
 
-// [關鍵] 這就是之前遺失的 shell_entry 函式定義
+// --- Tasks ---
+
 extern "C" fn shell_entry() -> ! {
-    user_println!("Shell initialized (Args Enabled).");
+    user_println!("Shell initialized (VirtIO Enabled).");
     let mut command = String::new();
     user_print!("eos> ");
 
@@ -131,10 +157,9 @@ extern "C" fn shell_entry() -> ! {
                 user_println!("");
                 let cmd_line = command.trim();
                 let parts: Vec<&str> = cmd_line.split_whitespace().collect();
-                
                 if !parts.is_empty() {
                     match parts[0] {
-                        "help" => user_println!("ls, cat <file>, exec <file> [args...], panic"),
+                        "help" => user_println!("ls, cat <file>, exec <file> [args...], dread <sector>, memtest, panic"),
                         "ls" => {
                             let mut idx = 0; let mut buf = [0u8; 32];
                             loop {
@@ -159,35 +184,50 @@ extern "C" fn shell_entry() -> ! {
                             }
                         },
                         "exec" => {
-                            if parts.len() < 2 {
-                                user_println!("Usage: exec <file> [args...]");
-                            } else {
+                            if parts.len() < 2 { user_println!("Usage: exec <file> [args...]"); }
+                            else {
                                 let fname = parts[1];
                                 let len = sys_file_len(fname);
-                                if len < 0 {
-                                    user_println!("File not found.");
-                                } else {
+                                if len < 0 { user_println!("File not found."); }
+                                else {
                                     let mut elf_data = vec![0u8; len as usize];
                                     sys_file_read(fname, &mut elf_data);
-                                    
-                                    // 參數處理: 切片 parts[1..]
                                     let args = &parts[1..];
-                                    
                                     user_println!("Loading {} with args {:?}...", fname, args);
                                     sys_exec(&elf_data, args);
                                 }
                             }
                         },
+                        // [新增] 讀取磁碟
+                        "dread" => {
+                            if parts.len() < 2 {
+                                user_println!("Usage: dread <sector_num>");
+                            } else {
+                                let sector = parse_int(parts[1]).unwrap_or(0);
+                                let mut buf = [0u8; 512];
+                                
+                                user_println!("Reading disk sector {}...", sector);
+                                sys_disk_read(sector, &mut buf);
+                                
+                                // 嘗試轉字串印出，如果失敗印 hex
+                                if let Ok(s) = core::str::from_utf8(&buf[0..64]) {
+                                    // 只印前 64 bytes 避免洗版
+                                    user_println!("Data: {}", s);
+                                } else {
+                                    user_println!("Data (Binary): {:x?}", &buf[0..16]);
+                                }
+                            }
+                        },
                         "memtest" => {
                             user_println!("Running Memory Stress Test...");
-                            for i in 0..10000 {
+                            for i in 0..1000 {
                                 let mut v = Vec::new(); v.push(i);
-                                if i % 1000 == 0 { user_println!("Iter {}", i); }
+                                if i % 100 == 0 { user_println!("Iter {}", i); }
                             }
                             user_println!("Done.");
                         },
                         "panic" => {
-                            user_println!("Crashing...");
+                            user_println!("Crashing on purpose...");
                             unsafe { (0x0 as *mut u8).write_volatile(0); }
                         },
                         _ => user_println!("Unknown: {}", parts[0]),
@@ -202,7 +242,6 @@ extern "C" fn shell_entry() -> ! {
     }
 }
 
-// 這也是之前可能遺失的 bg_task
 extern "C" fn bg_task() -> ! {
     loop { for _ in 0..5000000 {} }
 }
@@ -278,8 +317,6 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                     },
                     SYSCALL_EXEC => {
                         let elf_data = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
-                        
-                        // [讀取參數]
                         let argv_ptr = a2 as *const &str;
                         let argc = a3 as usize;
                         let argv_slice = core::slice::from_raw_parts(argv_ptr, argc);
@@ -296,7 +333,6 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                                 let stack_vaddr = 0xF000_0000;
                                 mm::page_table::map(&mut *new_table, stack_vaddr, stack_frame, PTE_U | PTE_R | PTE_W);
 
-                                // [推送參數到 User Stack]
                                 let stack_top_paddr = stack_frame + 4096;
                                 let mut sp_paddr = stack_top_paddr;
                                 let mut str_vaddrs = Vec::new();
@@ -311,8 +347,8 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                                     str_vaddrs.push(stack_vaddr + (sp_paddr - stack_frame));
                                 }
 
-                                sp_paddr -= sp_paddr % 8; // Align
-                                sp_paddr -= (str_vaddrs.len() + 1) * 8; // Pointers array
+                                sp_paddr -= sp_paddr % 8; 
+                                sp_paddr -= (str_vaddrs.len() + 1) * 8; 
                                 let argv_vaddr = stack_vaddr + (sp_paddr - stack_frame);
                                 let ptr_array = sp_paddr as *mut usize;
                                 for (i, vaddr) in str_vaddrs.iter().enumerate() {
@@ -327,9 +363,7 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                                 let mut new_task = Task::new_user(new_pid);
                                 new_task.root_ppn = (new_table as usize) >> 12;
                                 new_task.context.mepc = entry;
-                                new_task.context.regs[2] = sp_vaddr as u64; // SP
-                                
-                                // 設定 argc, argv
+                                new_task.context.regs[2] = sp_vaddr as u64; 
                                 new_task.context.regs[10] = argc as u64;
                                 new_task.context.regs[11] = argv_vaddr as u64;
 
@@ -338,6 +372,19 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                                 (*ctx_ptr).regs[10] = new_pid as u64;
                             } else { (*ctx_ptr).regs[10] = (-1isize) as u64; }
                         }
+                    },
+                    // [新增] 磁碟讀取實作
+                    SYSCALL_DISK_READ => {
+                        let sector = a0;
+                        let buf_ptr = a1 as *mut u8;
+                        let _len = a2;
+                        
+                        // 1. 核心讀取磁碟 (Blocking)
+                        let data = virtio::read_disk(sector);
+                        
+                        // 2. 複製到使用者空間
+                        // 注意：這裡是直接 copy，但在正式 OS 中需要檢查 user_ptr 是否合法
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, 512);
                     },
                     SYSCALL_EXIT => {
                         println!("[Kernel] Process exited code: {}", a0);
@@ -356,7 +403,6 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
             }
         }
         
-        // Crash Handling
         let mtval: usize;
         unsafe { core::arch::asm!("csrr {}, mtval", out(reg) mtval); }
         println!("\n[Crash] mcause={}, mepc={:x}, mtval={:x}", code, unsafe { (*ctx_ptr).mepc }, mtval);
@@ -368,11 +414,8 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
             if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
             scheduler.current_index = 0;
             let shell_task = &mut scheduler.tasks[0];
-            
-            // 重置 Shell
             shell_task.root_ppn = 0;
-            shell_task.context.mepc = shell_entry as u64; // 使用 shell_entry
-            
+            shell_task.context.mepc = shell_entry as u64;
             let mut mstatus: usize;
             core::arch::asm!("csrr {}, mstatus", out(reg) mstatus);
             mstatus &= !(3 << 11); mstatus |= 1 << 7;
@@ -385,7 +428,7 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> ! {
     println!("-----------------------------------");
-    println!("   EOS with Args Support           ");
+    println!("   EOS with VirtIO Disk Driver     ");
     println!("-----------------------------------");
 
     unsafe {
@@ -402,9 +445,18 @@ pub extern "C" fn rust_main() -> ! {
         mm::page_table::map(root, 0x1000_0000, 0x1000_0000, PTE_R | PTE_W);
         let mut addr = 0x0200_0000;
         while addr < 0x0200_FFFF { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
+        
+        // [修正] 擴大映射範圍包含 VirtIO (0x1000_1000 ~ 0x1000_8000)
+        // 這裡直接映射整個 0x1000_0000 ~ 0x1000_FFFF
+        println!("[Kernel] Mapping MMIO (UART + VirtIO)...");
+        let mut addr = 0x1000_0000;
+        let end_mmio = 0x1001_0000; 
+        while addr < end_mmio { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
+        
         let mut addr = 0x0C00_0000;
         let end_plic = 0x0C20_1000; 
         while addr < end_plic { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
+        
         let start = 0x8000_0000; let end = 0x8800_0000; 
         let mut addr = start;
         while addr < end { mm::page_table::map(root, addr, addr, PTE_R | PTE_W | PTE_X | PTE_U); addr += 4096; }
@@ -419,6 +471,11 @@ pub extern "C" fn rust_main() -> ! {
         scheduler.spawn(Task::new_kernel(1, bg_task));
 
         init_plic();
+        
+        // [新增] 初始化 VirtIO
+        virtio::init();
+        println!("[Kernel] VirtIO Initialized.");
+
         core::arch::asm!("csrw mtvec, {}", in(reg) (trap_vector as usize) | 1);
         let first_task = &mut scheduler.tasks[0];
         core::arch::asm!("csrw mscratch, {}", in(reg) &mut first_task.context);
