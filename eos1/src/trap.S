@@ -1,14 +1,39 @@
-# src/trap.S
 .section .text
-.globl trap_entry
-.align 4
-trap_entry:
-    # [1] 交換 sp 與 mscratch (保存 User SP)
+
+# [關鍵修正 1] 禁止使用壓縮指令 (RVC)
+# 確保每一條跳轉指令都佔用 4 bytes，維持向量表對齊
+.option norvc
+
+.align 2
+.globl trap_vector
+trap_vector:
+    j exception_entry       # 0: User Software
+    j exception_entry       # 1: Supervisor Software
+    j exception_entry       # 2: Reserved
+    j exception_entry       # 3: Machine Software
+    j exception_entry       # 4: User Timer
+    j exception_entry       # 5: Supervisor Timer
+    j exception_entry       # 6: Reserved
+    j timer_entry           # 7: Machine Timer
+    j exception_entry       # 8: User External
+    j exception_entry       # 9: Supervisor External
+    j exception_entry       # 10: Reserved
+    j external_entry        # 11: Machine External (PLIC)
+    j exception_entry       # 12
+    j exception_entry       # 13
+    j exception_entry       # 14
+    j exception_entry       # 15
+
+# [關鍵修正 2] 恢復允許壓縮指令 (如果是 riscv64gc，這通常是預設值)
+.option rvc
+
+# --- 保存與恢復巨集 ---
+
+.macro SAVE_CONTEXT
     csrrw sp, mscratch, sp
-    
     sd x1, 1*8(sp)
-    csrr t0, mscratch   # 取回 User SP
-    sd t0, 2*8(sp)      # 存入 Context
+    csrr t0, mscratch
+    sd t0, 2*8(sp)
     sd x3, 3*8(sp)
     sd x4, 4*8(sp)
     sd x5, 5*8(sp)
@@ -38,30 +63,16 @@ trap_entry:
     sd x29, 29*8(sp)
     sd x30, 30*8(sp)
     sd x31, 31*8(sp)
-
     csrr t0, mepc
     sd t0, 32*8(sp)
+.endm
 
-    # [2] 切換到中斷堆疊
-    mv s0, sp
-    la sp, _trap_stack_top
-    
-    mv a0, s0
-    call handle_trap
-    
-    # [3] 恢復環境
-    mv sp, a0
-
+.macro RESTORE_CONTEXT
     ld t0, 32*8(sp)
     csrw mepc, t0
-
-    ld t0, 2*8(sp)
-    csrw mscratch, t0   # 先把 User SP 放回 mscratch
-
     ld x1, 1*8(sp)
     ld x3, 3*8(sp)
     ld x4, 4*8(sp)
-    ld x5, 5*8(sp)
     ld x6, 6*8(sp)
     ld x7, 7*8(sp)
     ld x8, 8*8(sp)
@@ -88,12 +99,47 @@ trap_entry:
     ld x29, 29*8(sp)
     ld x30, 30*8(sp)
     ld x31, 31*8(sp)
-
+    ld t0, 2*8(sp)
+    csrw mscratch, t0
+    ld x5, 5*8(sp)
     csrrw sp, mscratch, sp
     mret
+.endm
+
+# --- Handler Entries ---
+
+.align 4
+exception_entry:
+    SAVE_CONTEXT
+    mv s0, sp
+    la sp, _trap_stack_top
+    mv a0, s0
+    call handle_trap
+    mv sp, a0
+    RESTORE_CONTEXT
+
+.align 4
+timer_entry:
+    SAVE_CONTEXT
+    mv s0, sp
+    la sp, _trap_stack_top
+    mv a0, s0
+    call handle_timer
+    mv sp, a0
+    RESTORE_CONTEXT
+
+.align 4
+external_entry:
+    SAVE_CONTEXT
+    mv s0, sp
+    la sp, _trap_stack_top
+    mv a0, s0
+    call handle_external
+    mv sp, a0
+    RESTORE_CONTEXT
 
 .section .bss
 .align 16
 _trap_stack:
-    .space 16384
+    .space 4096 * 4
 _trap_stack_top:

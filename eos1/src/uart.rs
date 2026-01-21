@@ -34,6 +34,16 @@ impl Uart {
             }
         }
     }
+
+
+    pub fn enable_interrupt(&self) {
+        let ptr = self.base_address as *mut u8;
+        unsafe {
+            // IER (Interrupt Enable Register) 是在 offset 1
+            // 寫入 1 代表開啟 "接收資料" 中斷
+            ptr.add(1).write_volatile(1);
+        }
+    }
 }
 
 impl fmt::Write for Uart {
