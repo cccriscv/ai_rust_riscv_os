@@ -6,10 +6,11 @@
 -----------------------------------
    EOS with Round-Robin Scheduler  
 -----------------------------------
+[Kernel] Heap Allocator initialized.
 [Kernel] MMU Enabled.
 [Kernel] Tasks spawned.
 [OS] Starting Scheduler...
-Shell initialized (Scheduler V1).
+Shell initialized (GC Heap Enabled).
 eos> ls
  - hello.txt
  - secret.txt
@@ -26,6 +27,7 @@ eos>
 [UserApp] Hello, World!
 [UserApp] I am running at 0x10000
 [UserApp] Calculation: 10 + 20 = 30
+[Kernel] Process exited code: 0
 ls
  - hello.txt
  - secret.txt

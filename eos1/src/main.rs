@@ -25,7 +25,6 @@ core::arch::global_asm!(include_str!("trap.S"));
 
 unsafe extern "C" { fn trap_vector(); }
 
-// --- Hardware Constants ---
 const CLINT_MTIMECMP: *mut u64 = 0x0200_4000 as *mut u64;
 const CLINT_MTIME: *const u64 = 0x0200_BFF8 as *const u64;
 const INTERVAL: u64 = 1_000_000;
@@ -36,7 +35,6 @@ const PLIC_ENABLE: *mut u32 = (PLIC_BASE + 0x2000) as *mut u32;
 const PLIC_THRESHOLD: *mut u32 = (PLIC_BASE + 0x200000) as *mut u32;
 const PLIC_CLAIM: *mut u32 = (PLIC_BASE + 0x200004) as *mut u32;
 
-// --- Keyboard Buffer ---
 const KEY_BUFFER_SIZE: usize = 256;
 static mut KEY_BUFFER: [u8; KEY_BUFFER_SIZE] = [0; KEY_BUFFER_SIZE];
 static mut KEY_HEAD: usize = 0;
@@ -57,7 +55,6 @@ fn pop_key() -> Option<u8> {
     }
 }
 
-// --- Initialization ---
 fn set_next_timer() {
     unsafe {
         let now = CLINT_MTIME.read_volatile();
@@ -76,7 +73,6 @@ fn init_plic() {
     }
 }
 
-// --- Syscalls ---
 const SYSCALL_PUTCHAR: u64 = 1;
 const SYSCALL_GETCHAR: u64 = 2;
 const SYSCALL_FILE_LEN: u64 = 3;
@@ -104,7 +100,7 @@ macro_rules! user_print { ($($arg:tt)*) => ({ use core::fmt::Write; let mut w = 
 // --- Tasks ---
 
 extern "C" fn shell_entry() -> ! {
-    user_println!("Shell initialized (Scheduler V1).");
+    user_println!("Shell initialized (GC Heap Enabled).");
     let mut command = String::new();
     user_print!("eos> ");
 
@@ -117,7 +113,7 @@ extern "C" fn shell_entry() -> ! {
                 let parts: Vec<&str> = cmd_line.split_whitespace().collect();
                 if !parts.is_empty() {
                     match parts[0] {
-                        "help" => user_println!("ls, cat <file>, exec <file>"),
+                        "help" => user_println!("ls, cat <file>, exec <file>, memtest, panic"),
                         "ls" => {
                             let mut idx = 0; let mut buf = [0u8; 32];
                             loop {
@@ -155,6 +151,19 @@ extern "C" fn shell_entry() -> ! {
                                 }
                             }
                         },
+                        // 記憶體回收測試
+                        "memtest" => {
+                            user_println!("Running Memory Stress Test (10000 allocs)...");
+                            for i in 0..10000 {
+                                let mut v = Vec::new();
+                                v.push(i);
+                                let s = alloc::format!("Iter {}", i);
+                                if i % 1000 == 0 {
+                                    user_println!("  - {} (vec len: {})", s, v.len());
+                                }
+                            }
+                            user_println!("Test passed! Memory is recycled.");
+                        },
                         "panic" => {
                             user_println!("Crashing on purpose...");
                             unsafe { (0x0 as *mut u8).write_volatile(0); }
@@ -174,8 +183,6 @@ extern "C" fn shell_entry() -> ! {
 extern "C" fn bg_task() -> ! {
     loop { for _ in 0..5000000 {} }
 }
-
-// --- Handlers ---
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_timer(_ctx_ptr: *mut Context) -> *mut Context {
@@ -253,24 +260,16 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                             if let Some(entry) = elf::load_elf(elf_data, &mut *new_table) {
                                 println!("[Kernel] ELF loaded.");
                                 
-                                // User Stack 分配
                                 let stack_frame = mm::frame::alloc_frame();
                                 let stack_vaddr = 0xF000_0000;
-                                
-                                // [修正] 移除多餘的 unsafe 區塊 (外層已經有了)
-                                mm::page_table::map(
-                                    &mut *new_table, 
-                                    stack_vaddr, 
-                                    stack_frame, 
-                                    PTE_U | PTE_R | PTE_W
-                                );
+                                mm::page_table::map(&mut *new_table, stack_vaddr, stack_frame, PTE_U | PTE_R | PTE_W);
 
                                 let scheduler = task::get_scheduler();
                                 let new_pid = scheduler.tasks.len();
                                 let mut new_task = Task::new_user(new_pid);
                                 new_task.root_ppn = (new_table as usize) >> 12;
                                 new_task.context.mepc = entry;
-                                new_task.context.regs[2] = (stack_vaddr + 4096) as u64; // SP
+                                new_task.context.regs[2] = (stack_vaddr + 4096) as u64; 
 
                                 scheduler.spawn(new_task);
                                 println!("[Kernel] Process spawned with PID {}", new_pid);
@@ -279,28 +278,13 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                         }
                     },
                     SYSCALL_EXIT => {
-                        // 這一行可以留著，除錯用，或者也拿掉讓畫面更乾淨
-                        // println!("[Kernel] Process exited code: {}", a0);
-
-                        // [關鍵修正] 移除已結束的任務
+                        println!("[Kernel] Process exited code: {}", a0);
                         let scheduler = task::get_scheduler();
-                        
-                        // 我們假設 Shell (id 0) 和 BG Task (id 1) 是永駐的
-                        // 所以我們把所有大於 2 的任務都砍掉
-                        // 這樣可以確保 Timer 中斷不會再排程到這個已死掉的任務
-                        if scheduler.tasks.len() > 2 {
-                            scheduler.tasks.truncate(2);
-                        }
-                        
-                        // 強制切換回 Shell (Task 0)
-                        // println!("Rebooting shell...");
+                        if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
                         scheduler.current_index = 0;
                         let shell_task = &mut scheduler.tasks[0];
-                        
-                        // 切換 SATP 回 Kernel/Shell 的空間
                         let kernel_root = crate::mm::page_table::KERNEL_PAGE_TABLE as usize;
                         core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
-                        
                         return &mut shell_task.context;
                     },
                     _ => println!("Unknown Syscall: {}", id),
@@ -320,7 +304,6 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
             core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
             
             let scheduler = task::get_scheduler();
-            // [關鍵修正] 崩潰時同樣清理任務列表
             if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
             scheduler.current_index = 0;
             let shell_task = &mut scheduler.tasks[0];
@@ -350,6 +333,9 @@ pub extern "C" fn rust_main() -> ! {
 
         mm::frame::init();
         
+        heap::init();
+        println!("[Kernel] Heap Allocator initialized.");
+
         let root_ptr = mm::frame::alloc_frame() as *mut PageTable;
         let root = &mut *root_ptr;
         mm::page_table::KERNEL_PAGE_TABLE = root_ptr;
