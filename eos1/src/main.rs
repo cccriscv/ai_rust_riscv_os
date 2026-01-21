@@ -5,11 +5,15 @@
 mod uart;
 mod task;
 mod heap;
+mod fs;
 
+// [修正 1] 加上 #[macro_use] 才能使用 vec! 巨集
+#[macro_use]
 extern crate alloc;
 use alloc::vec::Vec;
 use alloc::string::String;
-use alloc::format;
+// [修正 2] 移除未使用的 format 引用
+// use alloc::format;
 
 use core::panic::PanicInfo;
 use core::fmt;
@@ -22,7 +26,6 @@ unsafe extern "C" {
     fn trap_entry();
 }
 
-// --- 硬體與 Timer ---
 const CLINT_MTIMECMP: *mut u64 = 0x0200_4000 as *mut u64;
 const CLINT_MTIME: *const u64 = 0x0200_BFF8 as *const u64;
 const INTERVAL: u64 = 5_000_000;
@@ -34,42 +37,79 @@ fn set_next_timer() {
     }
 }
 
-// --- 全域變數 ---
 static mut TASK1: Task = Task::new();
 static mut TASK2: Task = Task::new();
 static mut CTX1: Context = Context::empty();
 static mut CTX2: Context = Context::empty();
 static mut CURR_TASK: usize = 1;
 
-// --- User Mode Syscall 介面 ---
 const SYSCALL_PUTCHAR: u64 = 1;
-const SYSCALL_GETCHAR: u64 = 2; // 新增 Syscall ID
+const SYSCALL_GETCHAR: u64 = 2;
+const SYSCALL_FILE_LEN: u64 = 3;
+const SYSCALL_FILE_READ: u64 = 4;
+const SYSCALL_FILE_LIST: u64 = 5;
 
 fn sys_putchar(c: u8) {
-    unsafe {
-        core::arch::asm!("ecall", in("a7") SYSCALL_PUTCHAR, in("a0") c);
-    }
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_PUTCHAR, in("a0") c); }
 }
 
-/// 嘗試讀取一個字元，如果沒按鍵則回傳 0
 fn sys_getchar() -> u8 {
     let mut ret: usize;
     unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a7") SYSCALL_GETCHAR,
-            lateout("a0") ret, // 讀取回傳值
-        );
+        core::arch::asm!("ecall", in("a7") SYSCALL_GETCHAR, lateout("a0") ret);
     }
     ret as u8
+}
+
+fn sys_file_len(name: &str) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYSCALL_FILE_LEN,
+            in("a0") name.as_ptr(),
+            in("a1") name.len(),
+            lateout("a0") ret,
+        );
+    }
+    ret
+}
+
+fn sys_file_read(name: &str, buf: &mut [u8]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYSCALL_FILE_READ,
+            in("a0") name.as_ptr(),
+            in("a1") name.len(),
+            in("a2") buf.as_mut_ptr(),
+            in("a3") buf.len(),
+            lateout("a0") ret,
+        );
+    }
+    ret
+}
+
+fn sys_file_list(index: usize, buf: &mut [u8]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYSCALL_FILE_LIST,
+            in("a0") index,
+            in("a1") buf.as_mut_ptr(),
+            in("a2") buf.len(),
+            lateout("a0") ret,
+        );
+    }
+    ret
 }
 
 struct UserOut;
 impl fmt::Write for UserOut {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.bytes() {
-            sys_putchar(c);
-        }
+        for c in s.bytes() { sys_putchar(c); }
         Ok(())
     }
 }
@@ -93,83 +133,89 @@ macro_rules! user_print {
     });
 }
 
-// --- [Shell Task] ---
+// --- Shell Task ---
 
 fn task1() -> ! {
     user_println!("Shell initialized. Type 'help' for commands.");
-    
     let mut command = String::new();
-    user_print!("eos> "); // 提示符號
+    user_print!("eos> ");
 
     loop {
-        // 1. 嘗試讀取鍵盤
         let c = sys_getchar();
-        
         if c != 0 {
-            // 2. 處理 Enter 鍵 (CR=13 或 LF=10)
             if c == 13 || c == 10 {
-                user_println!(""); // 換行
+                user_println!("");
+                let cmd_line = command.trim();
+                let parts: Vec<&str> = cmd_line.split_whitespace().collect();
                 
-                // 3. 執行指令
-                match command.as_str() {
-                    "help" => {
-                        user_println!("Available commands:");
-                        user_println!("  help  - Show this message");
-                        user_println!("  hello - Say hello");
-                        user_println!("  clear - Clear command buffer");
-                        user_println!("  panic - Test kernel panic");
-                    },
-                    "hello" => user_println!("Hello from User Mode!"),
-                    "clear" => user_println!("Buffer cleared."),
-                    "panic" => {
-                        user_println!("Attempting to crash...");
-                        unsafe {
-                            // 使用 write_volatile 強制 CPU 執行該指令
-                            // 繞過 Rust 的軟體 Null Check
-                            (0x0 as *mut u8).write_volatile(0);
-                        }
-                    },
-                    "" => {}, // 空指令
-                    _ => user_println!("Unknown command: '{}'", command),
+                if !parts.is_empty() {
+                    match parts[0] {
+                        "help" => {
+                            user_println!("Commands: help, ls, cat <file>, panic");
+                        },
+                        "ls" => {
+                            let mut idx = 0;
+                            let mut buf = [0u8; 32];
+                            loop {
+                                let len = sys_file_list(idx, &mut buf);
+                                if len < 0 { break; }
+                                let name = core::str::from_utf8(&buf[0..len as usize]).unwrap();
+                                user_println!(" - {}", name);
+                                idx += 1;
+                            }
+                        },
+                        "cat" => {
+                            if parts.len() < 2 {
+                                user_println!("Usage: cat <filename>");
+                            } else {
+                                let fname = parts[1];
+                                let len = sys_file_len(fname);
+                                if len < 0 {
+                                    user_println!("File not found: {}", fname);
+                                } else {
+                                    // 這裡使用了 vec! 巨集，需要 #[macro_use]
+                                    let mut content = vec![0u8; len as usize];
+                                    sys_file_read(fname, &mut content);
+                                    
+                                    if let Ok(s) = core::str::from_utf8(&content) {
+                                        user_println!("--- begin {} ---", fname);
+                                        user_println!("{}", s);
+                                        user_println!("--- end ---");
+                                    } else {
+                                        user_println!("(Binary file)");
+                                    }
+                                }
+                            }
+                        },
+                        "panic" => {
+                             user_println!("Crashing...");
+                             unsafe { (0x0 as *mut u8).write_volatile(0); }
+                        },
+                        _ => user_println!("Unknown: {}", parts[0]),
+                    }
                 }
                 
-                // 4. 重置 Buffer 並印出新的提示符
                 command.clear();
                 user_print!("eos> ");
             } 
-            // 處理 Backspace (127 或 8)
             else if c == 127 || c == 8 {
                 if !command.is_empty() {
                     command.pop();
-                    // 簡易的倒退刪除效果 (BS + Space + BS)
-                    sys_putchar(8);
-                    sys_putchar(b' ');
-                    sys_putchar(8);
+                    sys_putchar(8); sys_putchar(b' '); sys_putchar(8);
                 }
-            }
-            // 處理一般字元
-            else {
-                sys_putchar(c); // 回顯 (Echo) 到螢幕
+            } else {
+                sys_putchar(c);
                 command.push(c as char);
             }
         }
-
-        // 稍微讓出 CPU，避免佔用太多資源 (Polling 模式的缺點)
-        // 在真實 OS 會用 Wait For Interrupt (WFI)
         for _ in 0..1000 {} 
     }
 }
 
-// Task 2 保持安靜，證明多工還在跑
+// [修正 3] 移除未使用的變數 count，避免警告
 fn task2() -> ! {
-    let mut count = 0;
     loop {
-        // 每隔很久印一次，避免干擾 Shell 輸入
-        if count % 50 == 0 {
-            // user_println!("[Background Task] I am still running...");
-        }
-        count += 1;
-        for _ in 0..1000000 {}
+        for _ in 0..5000000 {}
     }
 }
 
@@ -179,40 +225,75 @@ fn task2() -> ! {
 pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
     let mcause: usize;
     unsafe { core::arch::asm!("csrr {}, mcause", out(reg) mcause); }
-
     let is_interrupt = (mcause >> 63) != 0;
     let code = mcause & 0xfff;
 
     if is_interrupt {
-        if code == 7 { // Timer Interrupt
+        if code == 7 { // Timer
             set_next_timer();
             unsafe {
-                if CURR_TASK == 1 {
-                    CURR_TASK = 2;
-                    return &raw mut CTX2;
-                } else {
-                    CURR_TASK = 1;
-                    return &raw mut CTX1;
-                }
+                if CURR_TASK == 1 { CURR_TASK = 2; return &raw mut CTX2; }
+                else { CURR_TASK = 1; return &raw mut CTX1; }
             }
         }
     } else {
-        // Exception & Syscall
-        if code == 8 { // Ecall
+        if code == 8 { // Syscall
             unsafe {
                 let id = (*ctx_ptr).regs[17];
-                let arg0 = (*ctx_ptr).regs[10];
+                let a0 = (*ctx_ptr).regs[10];
+                let a1 = (*ctx_ptr).regs[11];
+                let a2 = (*ctx_ptr).regs[12];
+                let a3 = (*ctx_ptr).regs[13];
 
                 match id {
-                    SYSCALL_PUTCHAR => {
-                        print!("{}", arg0 as u8 as char);
-                    }
+                    SYSCALL_PUTCHAR => print!("{}", a0 as u8 as char),
                     SYSCALL_GETCHAR => {
-                        // 呼叫 Driver 讀取
-                        if let Some(c) = uart::_getchar() {
-                            (*ctx_ptr).regs[10] = c as u64; // 回傳值放在 a0
+                         (*ctx_ptr).regs[10] = uart::_getchar().unwrap_or(0) as u64;
+                    },
+                    SYSCALL_FILE_LEN => {
+                        let ptr = a0 as *const u8;
+                        let len = a1 as usize;
+                        let slice = core::slice::from_raw_parts(ptr, len);
+                        let fname = core::str::from_utf8(slice).unwrap_or("");
+                        
+                        if let Some(data) = fs::get_file_content(fname) {
+                            (*ctx_ptr).regs[10] = data.len() as u64;
                         } else {
-                            (*ctx_ptr).regs[10] = 0; // 沒讀到回傳 0
+                            (*ctx_ptr).regs[10] = (-1isize) as u64;
+                        }
+                    },
+                    SYSCALL_FILE_READ => {
+                        let name_ptr = a0 as *const u8;
+                        let name_len = a1 as usize;
+                        let name_slice = core::slice::from_raw_parts(name_ptr, name_len);
+                        let fname = core::str::from_utf8(name_slice).unwrap_or("");
+
+                        let buf_ptr = a2 as *mut u8;
+                        let buf_len = a3 as usize;
+                        let user_buf = core::slice::from_raw_parts_mut(buf_ptr, buf_len);
+
+                        if let Some(data) = fs::get_file_content(fname) {
+                            let copy_len = core::cmp::min(data.len(), user_buf.len());
+                            user_buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                            (*ctx_ptr).regs[10] = copy_len as u64;
+                        } else {
+                            (*ctx_ptr).regs[10] = (-1isize) as u64;
+                        }
+                    },
+                    SYSCALL_FILE_LIST => {
+                        let idx = a0 as usize;
+                        let buf_ptr = a1 as *mut u8;
+                        let buf_len = a2 as usize;
+                        let user_buf = core::slice::from_raw_parts_mut(buf_ptr, buf_len);
+                        
+                        let files = fs::list_files();
+                        if idx < files.len() {
+                            let fname = files[idx].as_bytes();
+                            let copy_len = core::cmp::min(fname.len(), user_buf.len());
+                            user_buf[..copy_len].copy_from_slice(&fname[..copy_len]);
+                            (*ctx_ptr).regs[10] = copy_len as u64;
+                        } else {
+                            (*ctx_ptr).regs[10] = (-1isize) as u64;
                         }
                     }
                     _ => println!("Unknown Syscall: {}", id),
@@ -221,36 +302,18 @@ pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
                 return ctx_ptr;
             }
         } else {
-            // 捕捉非法存取 (User Mode Crash)
-            let mepc: usize;
-            let mtval: usize;
-            unsafe {
-                core::arch::asm!("csrr {}, mepc", out(reg) mepc);
-                core::arch::asm!("csrr {}, mtval", out(reg) mtval);
-            }
-            println!("\n[Segmentation Fault] App crashed at {:x}, accessing {:x}", mepc, mtval);
-            println!("Killing task and rebooting shell...");
-            
-            // 簡單處置：重置目前任務的 PC 回到 task1 開頭 (復活術)
-            unsafe {
-                (*ctx_ptr).mepc = task1 as u64;
-            }
+            println!("\n[Segmentation Fault]");
+            unsafe { (*ctx_ptr).mepc = task1 as u64; }
             return ctx_ptr;
         }
     }
-
-    let mepc: usize;
-    unsafe { core::arch::asm!("csrr {}, mepc", out(reg) mepc); }
-    println!("\n[FATAL] Trap: mcause={}, mepc={:x}", mcause, mepc);
     loop {}
 }
-
-// --- Kernel Entry ---
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> ! {
     println!("-----------------------------------");
-    println!("   EOS Interactive Shell           ");
+    println!("   EOS with RAM Filesystem         ");
     println!("-----------------------------------");
 
     unsafe {
@@ -274,7 +337,7 @@ pub extern "C" fn rust_main() -> ! {
         set_next_timer();
         core::arch::asm!("csrrs zero, mie, {}", in(reg) 1 << 7);
 
-        println!("[OS] User Mode initialized.");
+        println!("[OS] Filesystem mounted. Jumping to User Mode...");
 
         core::arch::asm!(
             "mv sp, {}",
@@ -284,7 +347,6 @@ pub extern "C" fn rust_main() -> ! {
             in(reg) CTX1.mepc
         );
     }
-
     loop {}
 }
 
