@@ -9,6 +9,7 @@ cargo build --release
 cp target/riscv64gc-unknown-none-elf/release/program ../mkfs/fs_root/program.elf
 cp target/riscv64gc-unknown-none-elf/release/ls ../mkfs/fs_root/ls
 cp target/riscv64gc-unknown-none-elf/release/cat ../mkfs/fs_root/cat
+cp target/riscv64gc-unknown-none-elf/release/pid ../mkfs/fs_root/pid 
 
 # 3. 重新打包磁碟
 cd ../mkfs

@@ -6,7 +6,8 @@ use crate::fs;
 use crate::elf;
 use crate::plic;
 use alloc::vec::Vec;
-use alloc::format;
+// [修正] 移除未使用的 format
+// use alloc::format; 
 
 // Syscall Constants
 pub const PUTCHAR: u64 = 1;
@@ -19,16 +20,23 @@ pub const CHDIR: u64 = 9;
 pub const EXEC: u64 = 6;
 pub const DISK_READ: u64 = 7;
 pub const EXIT: u64 = 93;
+pub const SCHED_YIELD: u64 = 124;
+pub const GETPID: u64 = 172;
 
-// [保留] 安全指針轉換
+// 安全指針轉換
 unsafe fn user_to_kernel_ptr<T>(vaddr: usize, current_task: &Task) -> Option<*mut T> {
     if vaddr >= 0x8000_0000 && vaddr < 0x8800_0000 {
         return Some(vaddr as *mut T);
     }
+    // [修正] 在 unsafe fn 內呼叫 unsafe 函式仍需包裹 unsafe block (E0133 消除)
     let root_ptr = (current_task.root_ppn << 12) as *const page_table::PageTable;
     if root_ptr.is_null() { return None; }
-    let root = &*root_ptr;
-    if let Some(paddr) = translate(root, vaddr) {
+    
+    // Dereference raw pointer
+    let root = unsafe { &*root_ptr };
+    
+    // translate is unsafe
+    if let Some(paddr) = unsafe { translate(root, vaddr) } {
         let offset = vaddr & 0xFFF;
         Some((paddr + offset) as *mut T)
     } else {
@@ -49,23 +57,37 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
         PUTCHAR => print!("{}", a0 as u8 as char),
         GETCHAR => ctx.regs[10] = plic::pop_key().unwrap_or(0) as u64,
         
+        SCHED_YIELD => {
+            // [修正] 包裹 unsafe
+            return unsafe { scheduler.schedule() };
+        },
+
+        GETPID => {
+            ctx.regs[10] = scheduler.current_task().id as u64;
+        },
+
         FILE_LEN => {
             let current_task = scheduler.current_task();
-            if let Some(kptr) = user_to_kernel_ptr::<u8>(a0 as usize, current_task) {
+            // [修正] 包裹 unsafe (user_to_kernel_ptr 是 unsafe fn)
+            if let Some(kptr) = unsafe { user_to_kernel_ptr::<u8>(a0 as usize, current_task) } {
                 let slice = unsafe { core::slice::from_raw_parts(kptr, a1 as usize) };
                 let fname = core::str::from_utf8(slice).unwrap_or("");
                 if let Some(data) = fs::get_file_content(fname) { ctx.regs[10] = data.len() as u64; }
                 else { ctx.regs[10] = (-1isize) as u64; }
             } else { ctx.regs[10] = (-1isize) as u64; }
         },
-
         FILE_READ => {
             let current_task = scheduler.current_task();
-            if let (Some(kname), Some(kbuf)) = (user_to_kernel_ptr::<u8>(a0 as usize, current_task), user_to_kernel_ptr::<u8>(a2 as usize, current_task)) {
+            // [修正] 包裹 unsafe
+            let ptrs = unsafe { 
+                (user_to_kernel_ptr::<u8>(a0 as usize, current_task), 
+                 user_to_kernel_ptr::<u8>(a2 as usize, current_task)) 
+            };
+            
+            if let (Some(kname), Some(kbuf)) = ptrs {
                 unsafe {
                     let fname = core::str::from_utf8(core::slice::from_raw_parts(kname, a1 as usize)).unwrap_or("");
                     let user_buf = core::slice::from_raw_parts_mut(kbuf, a3 as usize);
-                    
                     if let Some(data) = fs::get_file_content(fname) {
                         let len = core::cmp::min(data.len(), user_buf.len());
                         user_buf[..len].copy_from_slice(&data[..len]);
@@ -74,10 +96,15 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                 }
             } else { ctx.regs[10] = (-1isize) as u64; }
         },
-
         FILE_WRITE => {
             let current_task = scheduler.current_task();
-            if let (Some(kname), Some(kdata)) = (user_to_kernel_ptr::<u8>(a0 as usize, current_task), user_to_kernel_ptr::<u8>(a2 as usize, current_task)) {
+            // [修正] 包裹 unsafe
+            let ptrs = unsafe {
+                (user_to_kernel_ptr::<u8>(a0 as usize, current_task),
+                 user_to_kernel_ptr::<u8>(a2 as usize, current_task))
+            };
+
+            if let (Some(kname), Some(kdata)) = ptrs {
                 unsafe {
                     let name_slice = core::slice::from_raw_parts(kname, a1 as usize);
                     let fname = core::str::from_utf8(name_slice).unwrap_or("");
@@ -87,10 +114,9 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                 }
             } else { ctx.regs[10] = (-1isize) as u64; }
         },
-
         CHDIR => {
             let current_task = scheduler.current_task();
-            if let Some(kptr) = user_to_kernel_ptr::<u8>(a0 as usize, current_task) {
+            if let Some(kptr) = unsafe { user_to_kernel_ptr::<u8>(a0 as usize, current_task) } {
                 unsafe {
                     let slice = core::slice::from_raw_parts(kptr, a1 as usize);
                     let fname = core::str::from_utf8(slice).unwrap_or("");
@@ -99,10 +125,9 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                 }
             } else { ctx.regs[10] = (-1isize) as u64; }
         },
-
         FILE_LIST => {
             let current_task = scheduler.current_task();
-            if let Some(kptr) = user_to_kernel_ptr::<u8>(a1 as usize, current_task) {
+            if let Some(kptr) = unsafe { user_to_kernel_ptr::<u8>(a1 as usize, current_task) } {
                 unsafe {
                     let user_buf = core::slice::from_raw_parts_mut(kptr, a2 as usize);
                     let files = fs::list_files();
@@ -121,13 +146,18 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                 }
             } else { ctx.regs[10] = (-1isize) as u64; }
         },        
-
         EXEC => {
             let current_task = scheduler.current_task();
-            if let (Some(kelf), Some(kargv)) = (user_to_kernel_ptr::<u8>(a0 as usize, current_task), user_to_kernel_ptr::<&str>(a2 as usize, current_task)) {
+            // [修正] 包裹 unsafe
+            let ptrs = unsafe {
+                (user_to_kernel_ptr::<u8>(a0 as usize, current_task),
+                 user_to_kernel_ptr::<&str>(a2 as usize, current_task))
+            };
+
+            if let (Some(kelf), Some(kargv)) = ptrs {
                 unsafe {
                     let elf_data = core::slice::from_raw_parts(kelf, a1 as usize);
-                    let argv_ptr = kargv; // already ptr
+                    let argv_ptr = kargv; 
                     let argc = a3 as usize;
                     let argv_slice = core::slice::from_raw_parts(argv_ptr, argc);
 
@@ -143,7 +173,6 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                             let stack_vaddr = 0xF000_0000;
                             page_table::map(&mut *new_table, stack_vaddr, stack_frame, PTE_U | PTE_R | PTE_W);
 
-                            // Push Args logic
                             let stack_top_paddr = stack_frame + 4096;
                             let mut sp_paddr = stack_top_paddr;
                             let mut str_vaddrs = Vec::new();
@@ -168,7 +197,6 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                             let sp_vaddr = stack_vaddr + (sp_paddr - stack_frame);
 
                             let new_pid = scheduler.tasks.len();
-                            // [還原] 移除 parent_files 繼承
                             let mut new_task = Task::new_user(new_pid);
                             new_task.root_ppn = (new_table as usize) >> 12;
                             new_task.context.mepc = entry;
@@ -184,21 +212,17 @@ pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Co
                 }
             } else { ctx.regs[10] = (-1isize) as u64; }
         },
-        
         DISK_READ => {
             let sector = a0;
             let current_task = scheduler.current_task();
-            if let Some(kbuf) = user_to_kernel_ptr::<u8>(a1 as usize, current_task) {
+            if let Some(kbuf) = unsafe { user_to_kernel_ptr::<u8>(a1 as usize, current_task) } {
                 let data = crate::virtio::read_disk(sector);
                 unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), kbuf, 512); }
             }
         },
-
         EXIT => {
             println!("[Kernel] Process exited code: {}", a0);
             if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
-            
-            // Switch back to Shell
             scheduler.current_index = 0;
             let shell_task = &mut scheduler.tasks[0];
             unsafe {

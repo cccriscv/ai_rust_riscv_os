@@ -13,6 +13,9 @@ pub const SYSCALL_EXEC: u64 = 6;
 pub const SYSCALL_DISK_READ: u64 = 7;
 pub const SYSCALL_FILE_WRITE: u64 = 8;
 pub const SYSCALL_EXIT: u64 = 93;
+// [新增]
+pub const SYSCALL_YIELD: u64 = 124;
+pub const SYSCALL_GETPID: u64 = 172;
 
 // --- Wrappers ---
 
@@ -43,8 +46,19 @@ pub fn sys_file_list(index: usize, buf: &mut [u8]) -> isize {
     ret
 }
 
-// --- Println ---
+// [新增] Yield
+pub fn sys_yield() {
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_YIELD); }
+}
 
+// [新增] GetPID
+pub fn sys_getpid() -> usize {
+    let mut ret: usize;
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_GETPID, lateout("a0") ret); }
+    ret
+}
+
+// --- Println (保持不變) ---
 pub struct Console;
 impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -52,26 +66,22 @@ impl fmt::Write for Console {
         Ok(())
     }
 }
-
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
     let mut out = Console;
     out.write_fmt(args).unwrap();
 }
-
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::_print(format_args!($($arg)*)));
 }
-
 #[macro_export]
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
-// --- Entry Point Macro ---
-
+// --- Entry Point Macro (保持不變) ---
 #[macro_export]
 macro_rules! entry_point {
     ($path:path) => {
@@ -82,12 +92,9 @@ macro_rules! entry_point {
                 if argv.is_null() { &[] } 
                 else { core::slice::from_raw_parts(argv, argc) }
             };
-            
             let code = $path(args);
-            
             $crate::sys_exit(code);
         }
-
         #[panic_handler]
         fn panic(info: &core::panic::PanicInfo) -> ! {
             $crate::println!("\n[User Panic]");
