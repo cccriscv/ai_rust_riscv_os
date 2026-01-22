@@ -4,8 +4,13 @@ use alloc::boxed::Box;
 use alloc::vec;
 use crate::mm::page_table::KERNEL_PAGE_TABLE;
 
-// 堆疊大小 16KB
 pub const STACK_SIZE: usize = 16384;
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum TaskState {
+    Running, 
+    Zombie,  
+}
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone)]
@@ -20,15 +25,22 @@ impl Context {
     }
 }
 
+// 檔案描述符
+#[derive(Clone)]
+pub enum FileDescriptor {
+    Stdin,
+    Stdout,
+}
+
 #[repr(C, align(16))]
 pub struct Task {
-    #[allow(dead_code)]
     pub id: usize,
-    #[allow(dead_code)]
     pub stack: Vec<u8>, 
     pub context: Context,
     pub root_ppn: usize,
-    // [移除] files
+    pub files: Vec<Option<FileDescriptor>>,
+    pub state: TaskState,
+    pub exit_code: i32,
 }
 
 impl Task {
@@ -42,23 +54,26 @@ impl Task {
             stack,
             context: Context::empty(),
             root_ppn: 0,
+            files: vec![Some(FileDescriptor::Stdin), Some(FileDescriptor::Stdout)],
+            state: TaskState::Running, 
+            exit_code: 0,
         };
         
         task.context.regs[2] = aligned_sp as u64;
         task.context.mepc = entry as u64;
-        
         task
     }
 
-    // [還原] 移除 parent_files 參數
     pub fn new_user(id: usize) -> Self {
         let stack = vec![0u8; STACK_SIZE];
-        
         Self {
             id,
             stack,
             context: Context::empty(),
             root_ppn: 0,
+            files: vec![Some(FileDescriptor::Stdin), Some(FileDescriptor::Stdout)],
+            state: TaskState::Running,
+            exit_code: 0,
         }
     }
 }
@@ -72,28 +87,31 @@ pub static mut SCHEDULER: Option<Scheduler> = None;
 
 impl Scheduler {
     pub fn new() -> Self {
-        Self {
-            tasks: Vec::new(),
-            current_index: 0,
-        }
+        Self { tasks: Vec::new(), current_index: 0 }
     }
 
-    pub fn init() {
-        unsafe {
-            SCHEDULER = Some(Self::new());
-        }
-    }
+    pub fn init() { unsafe { SCHEDULER = Some(Self::new()); } }
 
-    pub fn spawn(&mut self, t: Task) {
-        self.tasks.push(Box::new(t));
-    }
+    pub fn spawn(&mut self, t: Task) { self.tasks.push(Box::new(t)); }
 
     pub unsafe fn schedule(&mut self) -> *mut Context {
-        if self.tasks.is_empty() {
-            panic!("No tasks to schedule!");
-        }
+        if self.tasks.is_empty() { panic!("No tasks!"); }
 
-        self.current_index = (self.current_index + 1) % self.tasks.len();
+        let start_index = self.current_index;
+        loop {
+            self.current_index = (self.current_index + 1) % self.tasks.len();
+            
+            if self.tasks[self.current_index].state == TaskState::Running {
+                break;
+            }
+            
+            if self.current_index == start_index {
+                if self.tasks[self.current_index].state == TaskState::Zombie {
+                    panic!("All tasks are zombies!");
+                }
+                break;
+            }
+        }
         
         let next_task = &mut self.tasks[self.current_index];
 
@@ -104,6 +122,7 @@ impl Scheduler {
             (8 << 60) | (kernel_root >> 12)
         };
         
+        // [修正] 加上 unsafe
         unsafe {
             core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
         }

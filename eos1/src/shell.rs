@@ -84,6 +84,27 @@ fn sys_chdir(name: &str) -> isize {
     ret 
 }
 
+// [新增] Yield: 主動讓出 CPU
+fn sys_yield() { 
+    unsafe { core::arch::asm!("ecall", in("a7") SCHED_YIELD); } 
+}
+
+// [新增] Wait: 等待子行程結束
+// 回傳值: >0 (子行程 PID), -1 (子行程仍在執行), -2 (無子行程)
+fn sys_wait(status: &mut i32) -> isize {
+    let mut ret: isize;
+    unsafe { 
+        core::arch::asm!(
+            "ecall", 
+            in("a7") WAIT, 
+            in("a0") -1, // 等待任意子行程
+            in("a1") status as *mut i32, 
+            lateout("a0") ret
+        ); 
+    }
+    ret
+}
+
 // --- Output Helpers ---
 
 struct UserOut;
@@ -127,7 +148,7 @@ fn parse_int(s: &str) -> Option<u64> {
     Some(res)
 }
 
-// [新增] 支援引號的參數解析器
+// 支援引號的參數解析器
 fn parse_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -135,7 +156,7 @@ fn parse_args(input: &str) -> Vec<String> {
 
     for c in input.chars() {
         match c {
-            '"' => { in_quote = !in_quote; } // 切換引號狀態，但不將引號加入字串
+            '"' => { in_quote = !in_quote; } // 切換引號狀態
             c if c.is_whitespace() && !in_quote => {
                 if !current.is_empty() {
                     args.push(current.clone());
@@ -154,7 +175,7 @@ fn parse_args(input: &str) -> Vec<String> {
 // --- Tasks ---
 
 pub extern "C" fn shell_entry() -> ! {
-    user_println!("Shell initialized (Smart Parser).");
+    user_println!("Shell initialized (Sync Mode).");
     let mut command = String::new();
     user_print!("eos> ");
 
@@ -165,13 +186,11 @@ pub extern "C" fn shell_entry() -> ! {
                 user_println!("");
                 let cmd_line = command.trim();
                 
-                // [修改] 使用 parse_args 取代 split_whitespace
-                // 注意：現在 parts 是 Vec<String>，不是 Vec<&str>
                 let parts = parse_args(cmd_line);
                 
                 if !parts.is_empty() {
                     match parts[0].as_str() {
-                        "help" => user_println!("ls, cat <file>, write <file> \"content\", exec <file> [args], cd <dir>, dread <sector>, memtest, panic"),
+                        "help" => user_println!("ls, cat <file>, write <file> \"text\", exec <file> [args], cd <dir>, dread <sector>, memtest, panic"),
                         
                         "ls" => {
                             let mut idx = 0; 
@@ -215,7 +234,6 @@ pub extern "C" fn shell_entry() -> ! {
                             } else {
                                 let fname = &parts[1];
                                 let content = &parts[2]; 
-                                // 因為有 parse_args，這裡的 content 已經包含引號內的完整字串（且去除了引號）
                                 user_println!("Writing to {}...", fname);
                                 let ret = sys_file_write(fname, content.as_bytes());
                                 if ret == 0 { user_println!("Success!"); } else { user_println!("Failed (Error: {})", ret); }
@@ -232,25 +250,42 @@ pub extern "C" fn shell_entry() -> ! {
                                     let mut elf_data = vec![0u8; len as usize];
                                     sys_file_read(fname, &mut elf_data);
                                     
-                                    // [修改] 將 Vec<String> 轉換為 Vec<&str> 供 sys_exec 使用
                                     let args_vec: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
                                     
-                                    user_println!("Loading {} with args {:?}...", fname, args_vec);
-                                    sys_exec(&elf_data, &args_vec);
+                                    // 1. 建立並執行子行程
+                                    let pid = sys_exec(&elf_data, &args_vec);
+                                    
+                                    if pid > 0 {
+                                        // 2. 同步等待子行程結束
+                                        let mut status = 0;
+                                        loop {
+                                            let wpid = sys_wait(&mut status);
+                                            if wpid > 0 {
+                                                // 子行程已結束並被回收
+                                                break;
+                                            } else if wpid == -1 {
+                                                // 子行程仍在執行，Shell 主動讓出 CPU
+                                                sys_yield();
+                                            } else {
+                                                // 無子行程 (理論上不應發生)
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        user_println!("Exec failed.");
+                                    }
                                 }
                             }
                         },
                         
                         "dread" => {
-                            if parts.len() < 2 { user_println!("Usage: dread <sector>"); }
-                            else {
-                                let sector = parse_int(&parts[1]).unwrap_or(0);
-                                let mut buf = [0u8; 512];
-                                user_println!("Reading sector {}...", sector);
-                                sys_disk_read(sector, &mut buf);
-                                if let Ok(s) = core::str::from_utf8(&buf[0..64]) { user_println!("Data: {}", s); }
-                                else { user_println!("Data: {:x?}", &buf[0..16]); }
-                            }
+                            let sector_str = parts.get(1).map(|s| s.as_str()).unwrap_or("0");
+                            let sector = parse_int(sector_str).unwrap_or(0);
+                            let mut buf = [0u8; 512];
+                            user_println!("Reading sector {}...", sector);
+                            sys_disk_read(sector, &mut buf);
+                            if let Ok(s) = core::str::from_utf8(&buf[0..64]) { user_println!("Data: {}", s); }
+                            else { user_println!("Data: {:x?}", &buf[0..16]); }
                         },
                         
                         "memtest" => {
