@@ -1,3 +1,4 @@
+// === FILE: ./eos1/src/main.rs ===
 #![no_std]
 #![no_main]
 
@@ -16,7 +17,9 @@ mod timer;
 mod trap;
 mod syscall;
 mod virtio;
-mod shell; // 引入 shell
+mod shell; 
+
+// [移除] mod pipe; mod sync;
 
 use core::panic::PanicInfo;
 use task::{Task, Scheduler};
@@ -59,8 +62,6 @@ pub extern "C" fn rust_main() -> ! {
         let end_plic = 0x0C20_1000; 
         while addr < end_plic { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; } // PLIC
         
-        // Mapping VirtIO (0x1000_1000) - Covered by UART region? No, UART is 0x10000000.
-        // VirtIO base is 0x10001000. Let's map a larger range.
         let mut addr = 0x1000_0000;
         let end_mmio = 0x1000_8000;
         while addr < end_mmio { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }

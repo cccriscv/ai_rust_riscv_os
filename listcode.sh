@@ -1,0 +1,1 @@
+find . -name "*.rs" -not -path "*/target/*" -not -path "*/.*" | sort | while read f; do echo "=== FILE: $f ==="; cat "$f"; echo -e "\n"; done > source_code_dump.txt

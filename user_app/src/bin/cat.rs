@@ -1,3 +1,4 @@
+// === FILE: ./user_app/src/bin/cat.rs ===
 #![no_std]
 #![no_main]
 #[macro_use] extern crate ulib;

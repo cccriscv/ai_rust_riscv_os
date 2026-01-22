@@ -1,9 +1,9 @@
+// === FILE: ./user_app/src/lib.rs ===
 #![no_std]
-// [修正] 移除 #![feature(panic_info_message)]，因為它已經穩定了，不需要再宣告
 
 use core::fmt;
 
-// --- System Call ID (必須與 Kernel 一致) ---
+// --- System Call ID ---
 pub const SYSCALL_PUTCHAR: u64 = 1;
 pub const SYSCALL_GETCHAR: u64 = 2;
 pub const SYSCALL_FILE_LEN: u64 = 3;
@@ -91,7 +91,6 @@ macro_rules! entry_point {
         #[panic_handler]
         fn panic(info: &core::panic::PanicInfo) -> ! {
             $crate::println!("\n[User Panic]");
-            // 在 Stable Rust 1.81+，可以直接印出 info
             $crate::println!("{}", info);
             $crate::sys_exit(-1);
         }

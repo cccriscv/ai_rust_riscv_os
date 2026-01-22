@@ -1,9 +1,10 @@
-use crate::syscall::*; // 引用 syscall.rs 定義的常數
+// === FILE: ./eos1/src/shell.rs ===
+use crate::syscall::*; 
 use alloc::vec::Vec;
 use alloc::string::String;
 use core::fmt;
 
-// --- Syscall Wrappers (User Library) ---
+// --- Syscall Wrappers ---
 
 fn sys_putchar(c: u8) { 
     unsafe { core::arch::asm!("ecall", in("a7") PUTCHAR, in("a0") c); } 
@@ -61,7 +62,6 @@ fn sys_disk_read(sector: u64, buf: &mut [u8]) {
     } 
 }
 
-// [新增] 檔案寫入系統呼叫
 fn sys_file_write(name: &str, data: &[u8]) -> isize {
     let mut ret: isize;
     unsafe {
@@ -127,10 +127,34 @@ fn parse_int(s: &str) -> Option<u64> {
     Some(res)
 }
 
+// [新增] 支援引號的參數解析器
+fn parse_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+
+    for c in input.chars() {
+        match c {
+            '"' => { in_quote = !in_quote; } // 切換引號狀態，但不將引號加入字串
+            c if c.is_whitespace() && !in_quote => {
+                if !current.is_empty() {
+                    args.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => { current.push(c); }
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 // --- Tasks ---
 
 pub extern "C" fn shell_entry() -> ! {
-    user_println!("Shell initialized (RW FS).");
+    user_println!("Shell initialized (Smart Parser).");
     let mut command = String::new();
     user_print!("eos> ");
 
@@ -140,11 +164,14 @@ pub extern "C" fn shell_entry() -> ! {
             if c == 13 || c == 10 { // Enter
                 user_println!("");
                 let cmd_line = command.trim();
-                let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+                
+                // [修改] 使用 parse_args 取代 split_whitespace
+                // 注意：現在 parts 是 Vec<String>，不是 Vec<&str>
+                let parts = parse_args(cmd_line);
                 
                 if !parts.is_empty() {
-                    match parts[0] {
-                        "help" => user_println!("ls, cat <file>, write <file> <content>, exec <file> [args], dread <sector>, memtest, panic"),
+                    match parts[0].as_str() {
+                        "help" => user_println!("ls, cat <file>, write <file> \"content\", exec <file> [args], cd <dir>, dread <sector>, memtest, panic"),
                         
                         "ls" => {
                             let mut idx = 0; 
@@ -161,7 +188,7 @@ pub extern "C" fn shell_entry() -> ! {
                         "cat" => {
                             if parts.len() < 2 { user_println!("Usage: cat <file>"); }
                             else {
-                                let fname = parts[1];
+                                let fname = &parts[1];
                                 let len = sys_file_len(fname);
                                 if len < 0 { user_println!("File not found."); }
                                 else {
@@ -172,46 +199,44 @@ pub extern "C" fn shell_entry() -> ! {
                                 }
                             }
                         },
+
                         "cd" => {
                             if parts.len() < 2 { user_println!("Usage: cd <dir>"); }
                             else {
-                                let ret = sys_chdir(parts[1]);
+                                let ret = sys_chdir(&parts[1]);
                                 if ret == 0 { user_println!("Changed directory."); }
                                 else { user_println!("Directory not found."); }
                             }
                         },
-                        // [新增] 寫入指令
+
                         "write" => {
                             if parts.len() < 3 {
-                                user_println!("Usage: write <filename> <content>");
+                                user_println!("Usage: write <filename> \"content\"");
                             } else {
-                                let fname = parts[1];
-                                let content = parts[2]; // 簡單取第三個部分，不支援空白
-                                
+                                let fname = &parts[1];
+                                let content = &parts[2]; 
+                                // 因為有 parse_args，這裡的 content 已經包含引號內的完整字串（且去除了引號）
                                 user_println!("Writing to {}...", fname);
                                 let ret = sys_file_write(fname, content.as_bytes());
-                                
-                                if ret == 0 {
-                                    user_println!("Success!");
-                                } else {
-                                    user_println!("Failed (Error: {})", ret);
-                                }
+                                if ret == 0 { user_println!("Success!"); } else { user_println!("Failed (Error: {})", ret); }
                             }
                         },
                         
                         "exec" => {
                             if parts.len() < 2 { user_println!("Usage: exec <file> [args...]"); }
                             else {
-                                let fname = parts[1];
+                                let fname = &parts[1];
                                 let len = sys_file_len(fname);
                                 if len < 0 { user_println!("File not found."); }
                                 else {
                                     let mut elf_data = vec![0u8; len as usize];
                                     sys_file_read(fname, &mut elf_data);
                                     
-                                    let args = &parts[1..];
-                                    user_println!("Loading {} with args {:?}...", fname, args);
-                                    sys_exec(&elf_data, args);
+                                    // [修改] 將 Vec<String> 轉換為 Vec<&str> 供 sys_exec 使用
+                                    let args_vec: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
+                                    
+                                    user_println!("Loading {} with args {:?}...", fname, args_vec);
+                                    sys_exec(&elf_data, &args_vec);
                                 }
                             }
                         },
@@ -219,7 +244,7 @@ pub extern "C" fn shell_entry() -> ! {
                         "dread" => {
                             if parts.len() < 2 { user_println!("Usage: dread <sector>"); }
                             else {
-                                let sector = parse_int(parts[1]).unwrap_or(0);
+                                let sector = parse_int(&parts[1]).unwrap_or(0);
                                 let mut buf = [0u8; 512];
                                 user_println!("Reading sector {}...", sector);
                                 sys_disk_read(sector, &mut buf);
@@ -251,7 +276,6 @@ pub extern "C" fn shell_entry() -> ! {
                 command.push(c as char); 
             }
         }
-        // Polling delay
         for _ in 0..1000 {}
     }
 }

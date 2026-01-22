@@ -1,0 +1,2195 @@
+=== FILE: ./eos1/src/elf.rs ===
+use core::mem::size_of;
+// [修正] 引入 PageTable 結構
+use crate::mm::page_table::{map, translate, PageTable, PTE_R, PTE_W, PTE_X, PTE_U};
+use crate::mm::frame::alloc_frame;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ElfHeader {
+    pub magic: [u8; 4],
+    pub class: u8,
+    pub endian: u8,
+    pub version: u8,
+    pub os_abi: u8,
+    pub abi_version: u8,
+    pub pad: [u8; 7],
+    pub type_: u16,
+    pub machine: u16,
+    pub version2: u32,
+    pub entry: u64,
+    pub phoff: u64,
+    pub shoff: u64,
+    pub flags: u32,
+    pub ehsize: u16,
+    pub phentsize: u16,
+    pub phnum: u16,
+    pub shentsize: u16,
+    pub shnum: u16,
+    pub shstrndx: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProgramHeader {
+    pub type_: u32,
+    pub flags: u32,
+    pub offset: u64,
+    pub vaddr: u64,
+    pub paddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
+/// 解析 ELF 並載入到指定的 Page Table 中
+pub unsafe fn load_elf(data: &[u8], page_table: &mut PageTable) -> Option<u64> {
+    if data.len() < size_of::<ElfHeader>() { return None; }
+    let header = unsafe { &*(data.as_ptr() as *const ElfHeader) };
+
+    if header.magic != [0x7f, 0x45, 0x4c, 0x46] || header.machine != 0xF3 {
+        return None;
+    }
+
+    let ph_table_ptr = unsafe { data.as_ptr().add(header.phoff as usize) };
+    
+    // [修改] 使用傳入的 page_table 作為映射目標
+    let root = page_table;
+
+    for i in 0..header.phnum {
+        let ph_ptr = unsafe { ph_table_ptr.add((i as usize) * (header.phentsize as usize)) };
+        let ph = unsafe { &*(ph_ptr as *const ProgramHeader) };
+
+        if ph.type_ == 1 { // LOAD Segment
+            let start_vpn = ph.vaddr >> 12;
+            let end_vpn = (ph.vaddr + ph.memsz + 4095) >> 12;
+
+            for vpn in start_vpn..end_vpn {
+                let page_vaddr = (vpn << 12) as usize;
+                
+                // 檢查是否已映射 (避免同一頁面重複分配導致資料覆蓋)
+                let mut paddr = unsafe { translate(root, page_vaddr).unwrap_or(0) };
+
+                if paddr == 0 {
+                    // 分配新的實體頁面
+                    paddr = alloc_frame();
+                    if paddr == 0 { return None; } 
+                    
+                    unsafe {
+                        map(root, page_vaddr, paddr, PTE_U | PTE_R | PTE_W | PTE_X);
+                    }
+                }
+
+                // 計算頁內偏移與寫入位置
+                // 寫入時使用 paddr (實體位址)，因為 M-Mode 核心不經過 MMU
+                let page_offset = if vpn == start_vpn { (ph.vaddr % 4096) as usize } else { 0 };
+                let dest_ptr = (paddr + page_offset) as *mut u8;
+                let page_remaining = 4096 - page_offset;
+                
+                let processed_len = (page_vaddr + page_offset) - (ph.vaddr as usize);
+                
+                if (processed_len as u64) < ph.filesz {
+                    let src_ptr = unsafe { data.as_ptr().add((ph.offset as usize) + processed_len) };
+                    let copy_len = core::cmp::min(page_remaining, (ph.filesz as usize) - processed_len);
+                    
+                    unsafe { core::ptr::copy_nonoverlapping(src_ptr, dest_ptr, copy_len); }
+                }
+                // BSS (補 0) 的部分由 alloc_frame 初始化時處理，這裡省略
+            }
+        }
+    }
+
+    // 確保指令寫入可見
+    unsafe { core::arch::asm!("fence.i"); }
+    
+    Some(header.entry)
+}-e 
+
+=== FILE: ./eos1/src/fs.rs ===
+use alloc::vec::Vec;
+use alloc::string::String;
+use crate::virtio;
+
+// 0=File, 1=Directory
+pub const TYPE_FILE: u8 = 0;
+pub const TYPE_DIR: u8 = 1;
+
+static mut CURRENT_DIR_SECTOR: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Superblock {
+    magic: u32,
+    file_count: u32,
+    _padding: [u8; 504],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DirEntry {
+    name: [u8; 32],
+    start_sector: u32,
+    size: u32,
+    file_type: u8,
+    _padding: [u8; 23],
+}
+
+// Helper: 讀取指定 Sector 的 Directory Table
+fn read_dir_entries(sector: u32) -> Vec<DirEntry> {
+    let dir_data = virtio::read_disk(sector as u64);
+    let mut entries = Vec::new();
+    let raw_slice = unsafe { core::slice::from_raw_parts(dir_data.as_ptr() as *const DirEntry, 8) };
+    entries.extend_from_slice(raw_slice);
+    entries
+}
+
+pub fn list_files() -> Vec<(u8, String)> {
+    let mut list = Vec::new();
+    let dir_sector = unsafe { CURRENT_DIR_SECTOR };
+    let entries = read_dir_entries(dir_sector);
+
+    for entry in entries {
+        if entry.start_sector == 0 { continue; }
+        if entry.name[0] == 0 { continue; }
+
+        let name_end = entry.name.iter().position(|&c| c == 0).unwrap_or(32);
+        if let Ok(name) = core::str::from_utf8(&entry.name[0..name_end]) {
+            list.push((entry.file_type, String::from(name)));
+        }
+    }
+    list
+}
+
+pub fn change_dir(name: &str) -> isize {
+    if name == "/" {
+        unsafe { CURRENT_DIR_SECTOR = 1; }
+        return 0;
+    }
+
+    let dir_sector = unsafe { CURRENT_DIR_SECTOR };
+    let entries = read_dir_entries(dir_sector);
+
+    for entry in entries {
+        let name_end = entry.name.iter().position(|&c| c == 0).unwrap_or(32);
+        let entry_name = core::str::from_utf8(&entry.name[0..name_end]).unwrap_or("");
+
+        if entry_name == name {
+            if entry.file_type == TYPE_DIR {
+                unsafe { CURRENT_DIR_SECTOR = entry.start_sector; }
+                return 0;
+            } else {
+                return -2;
+            }
+        }
+    }
+    -1
+}
+
+pub fn get_file_content(name: &str) -> Option<Vec<u8>> {
+    let dir_sector = unsafe { CURRENT_DIR_SECTOR };
+    let entries = read_dir_entries(dir_sector);
+
+    for entry in entries {
+        let name_end = entry.name.iter().position(|&c| c == 0).unwrap_or(32);
+        let entry_name = core::str::from_utf8(&entry.name[0..name_end]).unwrap_or("");
+
+        if entry_name == name {
+            if entry.file_type == TYPE_DIR { return None; }
+
+            let mut content = Vec::new();
+            let mut current_sec = entry.start_sector;
+            let mut remaining = entry.size;
+
+            while remaining > 0 {
+                let sector_data = virtio::read_disk(current_sec as u64);
+                let copy_len = core::cmp::min(remaining as usize, 512);
+                content.extend_from_slice(&sector_data[0..copy_len]);
+                remaining -= copy_len as u32;
+                current_sec += 1;
+            }
+            return Some(content);
+        }
+    }
+    None
+}
+
+// [修正] 恢復並修正寫入功能
+pub fn write_file(name: &str, data: &[u8]) -> isize {
+    // 1. 讀取 Superblock (為了檢查是否滿了，雖然這裡簡化處理)
+    let sb_data = virtio::read_disk(0);
+    let sb = unsafe { &*(sb_data.as_ptr() as *const Superblock) };
+    if sb.magic != 0x53465331 { return -1; }
+
+    // 2. 讀取當前目錄
+    let dir_sector = unsafe { CURRENT_DIR_SECTOR };
+    // 注意：我們要修改它，所以不能只用 read_dir_entries (它回傳 Vec clone)
+    let mut dir_buf = virtio::read_disk(dir_sector as u64);
+    let entries = unsafe { core::slice::from_raw_parts_mut(dir_buf.as_mut_ptr() as *mut DirEntry, 8) };
+
+    // 3. 找空位或同名檔案
+    let mut target_idx = None;
+    let mut free_idx = None;
+    
+    // 尋找最大使用的 Sector (全域搜尋有點難，這裡我們只搜尋當前目錄的最大值作為起點，這是個 Bug 但堪用)
+    // 正確做法是 Superblock 應該記錄 next_free_sector
+    let mut max_sector = 50; // 隨便抓個安全值，假設前面的都被用掉了
+
+    for i in 0..8 {
+        let entry = &entries[i];
+        if entry.start_sector == 0 {
+            if free_idx.is_none() { free_idx = Some(i); }
+            continue; 
+        }
+
+        // 更新 max sector
+        let used_sectors = (entry.size + 511) / 512;
+        let end = entry.start_sector + used_sectors;
+        if end > max_sector { max_sector = end; }
+
+        let name_end = entry.name.iter().position(|&c| c == 0).unwrap_or(32);
+        let entry_name = core::str::from_utf8(&entry.name[0..name_end]).unwrap_or("");
+        
+        if entry_name == name {
+            target_idx = Some(i);
+        }
+    }
+
+    let idx = if let Some(i) = target_idx { i } 
+              else if let Some(i) = free_idx { i } 
+              else { return -2; }; // 目錄滿了
+
+    // 4. 寫入資料
+    let start_sector = max_sector; // Append 到最後面
+    let mut current_sec = start_sector;
+    let mut remaining = data.len();
+    let mut offset = 0;
+
+    while remaining > 0 {
+        let copy_len = core::cmp::min(remaining, 512);
+        let mut sec_data = [0u8; 512];
+        sec_data[0..copy_len].copy_from_slice(&data[offset..offset+copy_len]);
+        virtio::write_disk(current_sec as u64, &sec_data);
+        
+        remaining -= copy_len;
+        offset += copy_len;
+        current_sec += 1;
+    }
+
+    // 5. 更新目錄 Entry
+    let entry = &mut entries[idx];
+    let name_bytes = name.as_bytes();
+    let copy_len = core::cmp::min(name_bytes.len(), 32);
+    
+    // 清空並寫入
+    entry.name = [0; 32];
+    entry.name[0..copy_len].copy_from_slice(&name_bytes[0..copy_len]);
+    entry.start_sector = start_sector;
+    entry.size = data.len() as u32;
+    entry.file_type = TYPE_FILE;
+
+    // 6. 寫回目錄表
+    virtio::write_disk(dir_sector as u64, &dir_buf);
+
+    0
+}-e 
+
+=== FILE: ./eos1/src/heap.rs ===
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::null_mut;
+use core::mem::{size_of, align_of};
+
+// 1MB 堆積空間
+const HEAP_SIZE: usize = 1024 * 1024;
+
+// 使用 usize 對齊，確保 HEAP_MEMORY 起始位址至少是 8-byte 對齊
+#[repr(align(16))]
+struct HeapStorage([u8; HEAP_SIZE]);
+
+static mut HEAP_MEMORY: HeapStorage = HeapStorage([0; HEAP_SIZE]);
+
+struct ListNode {
+    size: usize,
+    next: *mut ListNode,
+}
+
+impl ListNode {
+    const fn new(size: usize) -> Self {
+        Self { size, next: null_mut() }
+    }
+}
+
+pub struct LinkedListAllocator {
+    head: *mut ListNode,
+}
+
+unsafe impl Sync for LinkedListAllocator {}
+
+impl LinkedListAllocator {
+    pub const fn new() -> Self {
+        Self { head: null_mut() }
+    }
+
+    pub unsafe fn init(&mut self) {
+        // [修正] 加上 unsafe 區塊
+        let heap_start = unsafe { &raw mut HEAP_MEMORY.0 as usize };
+        
+        let align = align_of::<ListNode>();
+        let start_aligned = (heap_start + align - 1) & !(align - 1);
+        
+        let heap_end = heap_start + HEAP_SIZE;
+        let heap_size = heap_end - start_aligned;
+
+        let ptr = start_aligned as *mut ListNode;
+        unsafe {
+            ptr.write(ListNode::new(heap_size));
+        }
+        
+        self.head = ptr;
+    }
+}
+
+fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
+
+unsafe impl GlobalAlloc for LinkedListAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let allocator = unsafe { &mut *(&raw mut ALLOCATOR) };
+        
+        let mut prev: *mut ListNode = null_mut();
+        let mut curr = allocator.head;
+
+        // 要求對齊
+        let required_align = core::cmp::max(layout.align(), align_of::<ListNode>());
+        // [關鍵修正] 要求最小大小：必須至少能塞下一個 ListNode，否則 dealloc 會溢出
+        let min_size = size_of::<ListNode>();
+
+        while !curr.is_null() {
+            let (curr_addr, curr_size, curr_next) = unsafe {
+                (curr as usize, (*curr).size, (*curr).next)
+            };
+
+            // 1. 計算起始位置
+            let alloc_start = align_up(curr_addr, required_align);
+            
+            // 2. 計算使用者需要的結束位置
+            let actual_req_size = core::cmp::max(layout.size(), min_size); // 取較大者
+            
+            let alloc_end = match alloc_start.checked_add(actual_req_size) {
+                Some(end) => end,
+                None => return null_mut(),
+            };
+
+            // 3. 下一個節點的起始位置也必須對齊
+            let new_node_start = align_up(alloc_end, align_of::<ListNode>());
+
+            let region_end = curr_addr + curr_size;
+
+            if new_node_start <= region_end {
+                let remaining_size = region_end - new_node_start;
+                
+                if remaining_size >= size_of::<ListNode>() {
+                    let new_node_ptr = new_node_start as *mut ListNode;
+                    unsafe {
+                        (*new_node_ptr).size = remaining_size;
+                        (*new_node_ptr).next = curr_next;
+                    }
+
+                    if prev.is_null() {
+                        allocator.head = new_node_ptr;
+                    } else {
+                        unsafe { (*prev).next = new_node_ptr; }
+                    }
+                } else {
+                    // 不切割，直接給整塊
+                    if prev.is_null() {
+                        allocator.head = curr_next;
+                    } else {
+                        unsafe { (*prev).next = curr_next; }
+                    }
+                }
+
+                return alloc_start as *mut u8;
+            }
+
+            prev = curr;
+            curr = curr_next;
+        }
+
+        null_mut()
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let allocator = unsafe { &mut *(&raw mut ALLOCATOR) };
+
+        // 因為 alloc 時已經強制 min_size，所以這裡寫入是安全的
+        let min_size = size_of::<ListNode>();
+        // 注意：這裡計算 true_size 只是為了放進 ListNode.size，
+        // 實際上我們可能回收了更多 (因為 alloc 時的 padding)，但我們無法得知確切大小
+        // 這是簡易實作的缺陷 (會洩漏 padding)，但不影響穩定性
+        let true_size = core::cmp::max(layout.size(), min_size);
+        
+        let new_node_ptr = ptr as *mut ListNode;
+        
+        unsafe {
+            (*new_node_ptr).size = true_size;
+            (*new_node_ptr).next = allocator.head;
+        }
+        
+        allocator.head = new_node_ptr;
+    }
+}
+
+#[global_allocator]
+static mut ALLOCATOR: LinkedListAllocator = LinkedListAllocator::new();
+
+pub fn init() {
+    unsafe {
+        let ptr = &raw mut ALLOCATOR;
+        (*ptr).init();
+    }
+}-e 
+
+=== FILE: ./eos1/src/main.rs ===
+#![no_std]
+#![no_main]
+
+#[macro_use]
+extern crate alloc;
+
+// 模組宣告
+#[macro_use] mod uart;
+mod task;
+mod heap;
+mod fs;
+mod elf;
+mod mm;
+mod plic;
+mod timer;
+mod trap;
+mod syscall;
+mod virtio;
+mod shell; // 引入 shell
+
+use core::panic::PanicInfo;
+use task::{Task, Scheduler};
+#[allow(unused_imports)]
+use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U, KERNEL_PAGE_TABLE};
+
+core::arch::global_asm!(include_str!("entry.S"));
+core::arch::global_asm!(include_str!("trap.S"));
+
+unsafe extern "C" { fn trap_vector(); }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_main() -> ! {
+    println!("-----------------------------------");
+    println!("   EOS Refactored (v1.0)           ");
+    println!("-----------------------------------");
+
+    unsafe {
+        // 1. PMP Init
+        core::arch::asm!("csrw pmpaddr0, {}", in(reg) !0usize);
+        core::arch::asm!("csrw pmpcfg0, {}", in(reg) 0x1Fusize);
+
+        // 2. Memory Init
+        mm::frame::init();
+        heap::init();
+        
+        // 3. Page Table Init
+        let root_ptr = mm::frame::alloc_frame() as *mut PageTable;
+        let root = &mut *root_ptr;
+        mm::page_table::KERNEL_PAGE_TABLE = root_ptr;
+
+        // Mappings
+        mm::page_table::map(root, 0x1000_0000, 0x1000_0000, PTE_R | PTE_W); // UART
+        
+        let mut addr = 0x0200_0000;
+        while addr < 0x0200_FFFF { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; } // CLINT
+        
+        println!("[Kernel] Mapping MMIO (PLIC & VirtIO)...");
+        let mut addr = 0x0C00_0000;
+        let end_plic = 0x0C20_1000; 
+        while addr < end_plic { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; } // PLIC
+        
+        // Mapping VirtIO (0x1000_1000) - Covered by UART region? No, UART is 0x10000000.
+        // VirtIO base is 0x10001000. Let's map a larger range.
+        let mut addr = 0x1000_0000;
+        let end_mmio = 0x1000_8000;
+        while addr < end_mmio { mm::page_table::map(root, addr, addr, PTE_R | PTE_W); addr += 4096; }
+
+        let start = 0x8000_0000; let end = 0x8800_0000; 
+        let mut addr = start;
+        while addr < end { mm::page_table::map(root, addr, addr, PTE_R | PTE_W | PTE_X | PTE_U); addr += 4096; }
+
+        // 4. Enable MMU
+        let satp_val = (8 << 60) | ((root_ptr as usize) >> 12);
+        core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
+        println!("[Kernel] MMU Enabled.");
+
+        // 5. Tasks Init
+        Scheduler::init();
+        let scheduler = task::get_scheduler();
+        scheduler.spawn(Task::new_kernel(0, shell::shell_entry));
+        scheduler.spawn(Task::new_kernel(1, shell::bg_task));
+
+        // 6. Device Init
+        plic::init();
+        virtio::init();
+        println!("[Kernel] Devices Initialized.");
+
+        // 7. Interrupt Init
+        core::arch::asm!("csrw mtvec, {}", in(reg) (trap_vector as usize) | 1);
+        
+        let first_task = &mut scheduler.tasks[0];
+        core::arch::asm!("csrw mscratch, {}", in(reg) &mut first_task.context);
+        
+        let mstatus: usize = (0 << 11) | (1 << 7) | (1 << 13);
+        core::arch::asm!("csrw mstatus, {}", in(reg) mstatus);
+        
+        timer::set_next();
+        core::arch::asm!("csrrs zero, mie, {}", in(reg) (1 << 11) | (1 << 7));
+
+        println!("[OS] System Ready. Switching to Shell...");
+        
+        core::arch::asm!(
+            "mv sp, {}",
+            "csrw mepc, {}",
+            "mret",
+            in(reg) first_task.context.regs[2],
+            in(reg) first_task.context.mepc
+        );
+    }
+    loop {}
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! { println!("\n[PANIC] {}", info); loop {} }-e 
+
+=== FILE: ./eos1/src/mm/frame.rs ===
+// src/mm/frame.rs
+
+// [修正 1] 移除未使用的 import
+// use core::ptr::null_mut;
+
+// [修正 2] 加上 unsafe 關鍵字
+unsafe extern "C" {
+    fn ekernel();
+}
+
+const RAM_END: usize = 0x8800_0000;
+
+static mut NEXT_PFN: usize = 0;
+
+pub fn init() {
+    unsafe {
+        NEXT_PFN = ekernel as usize;
+        if NEXT_PFN % 4096 != 0 {
+            NEXT_PFN += 4096 - (NEXT_PFN % 4096);
+        }
+    }
+}
+
+pub fn alloc_frame() -> usize {
+    unsafe {
+        let paddr = NEXT_PFN;
+        let next_paddr = paddr + 4096;
+
+        if next_paddr >= RAM_END {
+            return 0; 
+        }
+
+        NEXT_PFN = next_paddr;
+        
+        core::ptr::write_bytes(paddr as *mut u8, 0, 4096);
+        
+        paddr
+    }
+}-e 
+
+=== FILE: ./eos1/src/mm/mod.rs ===
+// src/mm/mod.rs
+pub mod frame;
+pub mod page_table; -e 
+
+=== FILE: ./eos1/src/mm/page_table.rs ===
+use super::frame::alloc_frame;
+
+#[allow(dead_code)]
+pub const PTE_V: usize = 1 << 0;
+pub const PTE_R: usize = 1 << 1;
+pub const PTE_W: usize = 1 << 2;
+pub const PTE_X: usize = 1 << 3;
+pub const PTE_U: usize = 1 << 4;
+#[allow(dead_code)]
+pub const PTE_G: usize = 1 << 5;
+#[allow(dead_code)]
+pub const PTE_A: usize = 1 << 6;
+#[allow(dead_code)]
+pub const PTE_D: usize = 1 << 7;
+
+pub static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct PageTableEntry(pub usize);
+
+impl PageTableEntry {
+    pub fn is_valid(&self) -> bool { (self.0 & PTE_V) != 0 }
+    pub fn ppn(&self) -> usize { (self.0 >> 10) & ((1 << 44) - 1) }
+    pub fn set_next_table(&mut self, ppn: usize) { self.0 = (ppn << 10) | PTE_V; }
+    pub fn set_entry(&mut self, ppn: usize, flags: usize) { self.0 = (ppn << 10) | flags | PTE_V; }
+}
+
+#[repr(C, align(4096))]
+pub struct PageTable {
+    pub entries: [PageTableEntry; 512],
+}
+
+pub unsafe fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: usize) {
+    let vpn2 = (vaddr >> 30) & 0x1FF;
+    let vpn1 = (vaddr >> 21) & 0x1FF;
+    let vpn0 = (vaddr >> 12) & 0x1FF;
+
+    let mut pte = &mut root.entries[vpn2];
+    let mut next_table: *mut PageTable;
+
+    if !pte.is_valid() {
+        let frame = alloc_frame();
+        if frame == 0 { panic!("Map OOM L1"); }
+        pte.set_next_table(frame >> 12);
+    }
+    next_table = (pte.ppn() << 12) as *mut PageTable;
+    let table1 = unsafe { &mut *next_table };
+
+    pte = &mut table1.entries[vpn1];
+    if !pte.is_valid() {
+        let frame = alloc_frame();
+        if frame == 0 { panic!("Map OOM L0"); }
+        pte.set_next_table(frame >> 12);
+    }
+    next_table = (pte.ppn() << 12) as *mut PageTable;
+    let table0 = unsafe { &mut *next_table };
+
+    pte = &mut table0.entries[vpn0];
+    pte.set_entry(paddr >> 12, flags);
+}
+
+pub unsafe fn translate(root: &PageTable, vaddr: usize) -> Option<usize> {
+    let vpn2 = (vaddr >> 30) & 0x1FF;
+    let vpn1 = (vaddr >> 21) & 0x1FF;
+    let vpn0 = (vaddr >> 12) & 0x1FF;
+
+    let pte2 = &root.entries[vpn2];
+    if !pte2.is_valid() { return None; }
+    let table1 = unsafe { &*((pte2.ppn() << 12) as *const PageTable) };
+
+    let pte1 = &table1.entries[vpn1];
+    if !pte1.is_valid() { return None; }
+    let table0 = unsafe { &*((pte1.ppn() << 12) as *const PageTable) };
+
+    let pte0 = &table0.entries[vpn0];
+    if !pte0.is_valid() { return None; }
+
+    Some(pte0.ppn() << 12)
+}
+
+pub unsafe fn new_user_page_table() -> *mut PageTable {
+    let root_ptr = alloc_frame() as *mut PageTable;
+    if root_ptr.is_null() { return core::ptr::null_mut(); }
+    
+    // [修正] 包裹在 unsafe 中
+    let root = unsafe { &mut *root_ptr };
+    let kernel_root = unsafe { &*KERNEL_PAGE_TABLE };
+    
+    for i in 0..512 {
+        let entry = kernel_root.entries[i];
+        if entry.is_valid() {
+            root.entries[i] = entry;
+        } else {
+            root.entries[i] = PageTableEntry(0);
+        }
+    }
+    root_ptr
+}-e 
+
+=== FILE: ./eos1/src/plic.rs ===
+use crate::uart;
+
+pub const BASE: usize = 0x0c00_0000;
+pub const PRIORITY: *mut u32 = BASE as *mut u32;
+pub const ENABLE: *mut u32 = (BASE + 0x2000) as *mut u32;
+pub const THRESHOLD: *mut u32 = (BASE + 0x200000) as *mut u32;
+pub const CLAIM: *mut u32 = (BASE + 0x200004) as *mut u32;
+
+// 鍵盤緩衝區 (原本在 main.rs)
+const KEY_BUFFER_SIZE: usize = 256;
+static mut KEY_BUFFER: [u8; KEY_BUFFER_SIZE] = [0; KEY_BUFFER_SIZE];
+static mut KEY_HEAD: usize = 0;
+static mut KEY_TAIL: usize = 0;
+
+pub fn init() {
+    unsafe {
+        let writer = &raw mut uart::WRITER;
+        (*writer).enable_interrupt();
+        let irq_uart = 10; 
+        PRIORITY.add(irq_uart).write_volatile(1);
+        ENABLE.write_volatile(1 << irq_uart);
+        THRESHOLD.write_volatile(0);
+    }
+}
+
+pub fn push_key(c: u8) {
+    unsafe {
+        let next = (KEY_HEAD + 1) % KEY_BUFFER_SIZE;
+        if next != KEY_TAIL { KEY_BUFFER[KEY_HEAD] = c; KEY_HEAD = next; }
+    }
+}
+
+pub fn pop_key() -> Option<u8> {
+    unsafe {
+        if KEY_HEAD == KEY_TAIL { return None; }
+        let c = KEY_BUFFER[KEY_TAIL];
+        KEY_TAIL = (KEY_TAIL + 1) % KEY_BUFFER_SIZE;
+        Some(c)
+    }
+}
+
+// 處理 PLIC 中斷的邏輯
+pub fn handle_interrupt() {
+    unsafe {
+        let irq = CLAIM.read_volatile();
+        if irq == 10 { 
+            while let Some(c) = uart::_getchar() { push_key(c); }
+        }
+        CLAIM.write_volatile(irq);
+    }
+}-e 
+
+=== FILE: ./eos1/src/shell.rs ===
+use crate::syscall::*; // 引用 syscall.rs 定義的常數
+use alloc::vec::Vec;
+use alloc::string::String;
+use core::fmt;
+
+// --- Syscall Wrappers (User Library) ---
+
+fn sys_putchar(c: u8) { 
+    unsafe { core::arch::asm!("ecall", in("a7") PUTCHAR, in("a0") c); } 
+}
+
+fn sys_getchar() -> u8 { 
+    let mut ret: usize; 
+    unsafe { core::arch::asm!("ecall", in("a7") GETCHAR, lateout("a0") ret); } 
+    ret as u8 
+}
+
+fn sys_file_len(name: &str) -> isize { 
+    let mut ret: isize; 
+    unsafe { core::arch::asm!("ecall", in("a7") FILE_LEN, in("a0") name.as_ptr(), in("a1") name.len(), lateout("a0") ret); } 
+    ret 
+}
+
+fn sys_file_read(name: &str, buf: &mut [u8]) -> isize { 
+    let mut ret: isize; 
+    unsafe { core::arch::asm!("ecall", in("a7") FILE_READ, in("a0") name.as_ptr(), in("a1") name.len(), in("a2") buf.as_mut_ptr(), in("a3") buf.len(), lateout("a0") ret); } 
+    ret 
+}
+
+fn sys_file_list(index: usize, buf: &mut [u8]) -> isize { 
+    let mut ret: isize; 
+    unsafe { core::arch::asm!("ecall", in("a7") FILE_LIST, in("a0") index, in("a1") buf.as_mut_ptr(), in("a2") buf.len(), lateout("a0") ret); } 
+    ret 
+}
+
+fn sys_exec(data: &[u8], argv: &[&str]) -> isize { 
+    let mut ret: isize; 
+    unsafe { 
+        core::arch::asm!(
+            "ecall", 
+            in("a7") EXEC, 
+            in("a0") data.as_ptr(), 
+            in("a1") data.len(), 
+            in("a2") argv.as_ptr(), 
+            in("a3") argv.len(), 
+            lateout("a0") ret
+        ); 
+    } 
+    ret 
+}
+
+fn sys_disk_read(sector: u64, buf: &mut [u8]) { 
+    unsafe { 
+        core::arch::asm!(
+            "ecall", 
+            in("a7") DISK_READ, 
+            in("a0") sector, 
+            in("a1") buf.as_mut_ptr(), 
+            in("a2") buf.len()
+        ); 
+    } 
+}
+
+// [新增] 檔案寫入系統呼叫
+fn sys_file_write(name: &str, data: &[u8]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") FILE_WRITE,
+            in("a0") name.as_ptr(),
+            in("a1") name.len(),
+            in("a2") data.as_ptr(),
+            in("a3") data.len(),
+            lateout("a0") ret,
+        );
+    }
+    ret
+}
+
+fn sys_chdir(name: &str) -> isize { 
+    let mut ret: isize; 
+    unsafe { core::arch::asm!("ecall", in("a7") CHDIR, in("a0") name.as_ptr(), in("a1") name.len(), lateout("a0") ret); } 
+    ret 
+}
+
+// --- Output Helpers ---
+
+struct UserOut;
+impl fmt::Write for UserOut { 
+    fn write_str(&mut self, s: &str) -> fmt::Result { 
+        for c in s.bytes() { sys_putchar(c); } 
+        Ok(()) 
+    } 
+}
+
+#[macro_export]
+macro_rules! user_println { 
+    ($($arg:tt)*) => ({ 
+        use core::fmt::Write; 
+        let mut w = crate::shell::UserOut; 
+        let _ = write!(w, $($arg)*); 
+        let _ = write!(w, "\n"); 
+    }); 
+}
+
+#[macro_export]
+macro_rules! user_print { 
+    ($($arg:tt)*) => ({ 
+        use core::fmt::Write; 
+        let mut w = crate::shell::UserOut; 
+        let _ = write!(w, $($arg)*); 
+    }); 
+}
+
+// --- Helpers ---
+
+fn parse_int(s: &str) -> Option<u64> {
+    let mut res: u64 = 0;
+    for c in s.bytes() {
+        if c >= b'0' && c <= b'9' { 
+            res = res * 10 + (c - b'0') as u64; 
+        } else { 
+            return None; 
+        }
+    }
+    Some(res)
+}
+
+// --- Tasks ---
+
+pub extern "C" fn shell_entry() -> ! {
+    user_println!("Shell initialized (RW FS).");
+    let mut command = String::new();
+    user_print!("eos> ");
+
+    loop {
+        let c = sys_getchar();
+        if c != 0 {
+            if c == 13 || c == 10 { // Enter
+                user_println!("");
+                let cmd_line = command.trim();
+                let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+                
+                if !parts.is_empty() {
+                    match parts[0] {
+                        "help" => user_println!("ls, cat <file>, write <file> <content>, exec <file> [args], dread <sector>, memtest, panic"),
+                        
+                        "ls" => {
+                            let mut idx = 0; 
+                            let mut buf = [0u8; 32];
+                            loop {
+                                let len = sys_file_list(idx, &mut buf);
+                                if len < 0 { break; }
+                                let name = core::str::from_utf8(&buf[0..len as usize]).unwrap();
+                                user_println!(" - {}", name); 
+                                idx += 1;
+                            }
+                        },
+                        
+                        "cat" => {
+                            if parts.len() < 2 { user_println!("Usage: cat <file>"); }
+                            else {
+                                let fname = parts[1];
+                                let len = sys_file_len(fname);
+                                if len < 0 { user_println!("File not found."); }
+                                else {
+                                    let mut content = vec![0u8; len as usize];
+                                    sys_file_read(fname, &mut content);
+                                    if let Ok(s) = core::str::from_utf8(&content) { user_println!("{}", s); }
+                                    else { user_println!("(Binary)"); }
+                                }
+                            }
+                        },
+                        "cd" => {
+                            if parts.len() < 2 { user_println!("Usage: cd <dir>"); }
+                            else {
+                                let ret = sys_chdir(parts[1]);
+                                if ret == 0 { user_println!("Changed directory."); }
+                                else { user_println!("Directory not found."); }
+                            }
+                        },
+                        // [新增] 寫入指令
+                        "write" => {
+                            if parts.len() < 3 {
+                                user_println!("Usage: write <filename> <content>");
+                            } else {
+                                let fname = parts[1];
+                                let content = parts[2]; // 簡單取第三個部分，不支援空白
+                                
+                                user_println!("Writing to {}...", fname);
+                                let ret = sys_file_write(fname, content.as_bytes());
+                                
+                                if ret == 0 {
+                                    user_println!("Success!");
+                                } else {
+                                    user_println!("Failed (Error: {})", ret);
+                                }
+                            }
+                        },
+                        
+                        "exec" => {
+                            if parts.len() < 2 { user_println!("Usage: exec <file> [args...]"); }
+                            else {
+                                let fname = parts[1];
+                                let len = sys_file_len(fname);
+                                if len < 0 { user_println!("File not found."); }
+                                else {
+                                    let mut elf_data = vec![0u8; len as usize];
+                                    sys_file_read(fname, &mut elf_data);
+                                    
+                                    let args = &parts[1..];
+                                    user_println!("Loading {} with args {:?}...", fname, args);
+                                    sys_exec(&elf_data, args);
+                                }
+                            }
+                        },
+                        
+                        "dread" => {
+                            if parts.len() < 2 { user_println!("Usage: dread <sector>"); }
+                            else {
+                                let sector = parse_int(parts[1]).unwrap_or(0);
+                                let mut buf = [0u8; 512];
+                                user_println!("Reading sector {}...", sector);
+                                sys_disk_read(sector, &mut buf);
+                                if let Ok(s) = core::str::from_utf8(&buf[0..64]) { user_println!("Data: {}", s); }
+                                else { user_println!("Data: {:x?}", &buf[0..16]); }
+                            }
+                        },
+                        
+                        "memtest" => {
+                            for i in 0..1000 { let mut v = Vec::new(); v.push(i); }
+                            user_println!("Memtest done.");
+                        },
+                        
+                        "panic" => unsafe { (0x0 as *mut u8).write_volatile(0); },
+                        
+                        _ => user_println!("Unknown: {}", parts[0]),
+                    }
+                }
+                command.clear(); 
+                user_print!("eos> ");
+            } 
+            else if c == 127 || c == 8 { // Backspace
+                if !command.is_empty() { 
+                    command.pop(); 
+                    sys_putchar(8); sys_putchar(b' '); sys_putchar(8); 
+                }
+            } else { 
+                sys_putchar(c); 
+                command.push(c as char); 
+            }
+        }
+        // Polling delay
+        for _ in 0..1000 {}
+    }
+}
+
+pub extern "C" fn bg_task() -> ! {
+    loop { for _ in 0..5000000 {} }
+}-e 
+
+=== FILE: ./eos1/src/syscall.rs ===
+use crate::task::{self, Task};
+use crate::mm::page_table::{new_user_page_table, PTE_U, PTE_R, PTE_W, KERNEL_PAGE_TABLE};
+use crate::mm::{frame, page_table};
+use crate::fs;
+use crate::elf;
+use crate::plic;
+// [修正] 移除未使用的 timer 引用
+use alloc::vec::Vec;
+
+// Syscall Constants
+pub const PUTCHAR: u64 = 1;
+pub const GETCHAR: u64 = 2;
+pub const FILE_LEN: u64 = 3;
+pub const FILE_READ: u64 = 4;
+pub const FILE_LIST: u64 = 5;
+pub const FILE_WRITE: u64 = 8; // 注意：確認這 ID 沒有跟其他衝突
+pub const CHDIR: u64 = 9;
+pub const EXEC: u64 = 6;
+pub const DISK_READ: u64 = 7;
+pub const EXIT: u64 = 93;
+
+pub unsafe fn dispatcher(ctx: &mut crate::task::Context) -> *mut crate::task::Context {
+    let id = ctx.regs[17];
+    let a0 = ctx.regs[10];
+    let a1 = ctx.regs[11];
+    let a2 = ctx.regs[12];
+    let a3 = ctx.regs[13];
+
+    match id {
+        PUTCHAR => print!("{}", a0 as u8 as char),
+        GETCHAR => ctx.regs[10] = plic::pop_key().unwrap_or(0) as u64,
+        
+        FILE_LEN => {
+            // [修正] 包裹 unsafe
+            let slice = unsafe { core::slice::from_raw_parts(a0 as *const u8, a1 as usize) };
+            let fname = core::str::from_utf8(slice).unwrap_or("");
+            if let Some(data) = fs::get_file_content(fname) { ctx.regs[10] = data.len() as u64; }
+            else { ctx.regs[10] = (-1isize) as u64; }
+        },
+        FILE_READ => {
+            // [修正] 包裹 unsafe
+            unsafe {
+                let slice = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
+                let fname = core::str::from_utf8(slice).unwrap_or("");
+                let user_buf = core::slice::from_raw_parts_mut(a2 as *mut u8, a3 as usize);
+                
+                if let Some(data) = fs::get_file_content(fname) {
+                    let len = core::cmp::min(data.len(), user_buf.len());
+                    user_buf[..len].copy_from_slice(&data[..len]);
+                    ctx.regs[10] = len as u64;
+                } else { ctx.regs[10] = (-1isize) as u64; }
+            }
+        },
+        FILE_WRITE => {
+            unsafe {
+                let name_ptr = a0 as *const u8;
+                let name_len = a1 as usize;
+                let data_ptr = a2 as *const u8;
+                let data_len = a3 as usize;
+
+                let name_slice = core::slice::from_raw_parts(name_ptr, name_len);
+                let fname = core::str::from_utf8(name_slice).unwrap_or("");
+                
+                let data_slice = core::slice::from_raw_parts(data_ptr, data_len);
+
+                // 呼叫 FS 寫入
+                let ret = fs::write_file(fname, data_slice);
+                ctx.regs[10] = ret as u64;
+            }
+        },
+// dispatcher match 內新增
+        CHDIR => {
+            unsafe {
+                let slice = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
+                let fname = core::str::from_utf8(slice).unwrap_or("");
+                let ret = fs::change_dir(fname);
+                ctx.regs[10] = ret as u64;
+            }
+        },
+        
+// 修改 FILE_LIST，因為現在回傳 (Type, Name) 而不是只回傳 Name
+// 這邊為了相容舊的 shell ls，我們暫時只把 name 填回去，
+// 或者我們可以讓 ls 顯示 [DIR] 前綴
+        FILE_LIST => {
+            unsafe {
+                let user_buf = core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize);
+                let files = fs::list_files(); // 這是 Vec<(u8, String)>
+                if (a0 as usize) < files.len() {
+                    let (ftype, name) = &files[a0 as usize];
+                    // 格式化字串：如果是目錄加 "/"
+                    let display_name = if *ftype == 1 { 
+                        alloc::format!("{}/", name) 
+                    } else { 
+                        alloc::format!("{}", name) 
+                    };
+                    
+                    let bytes = display_name.as_bytes();
+                    let len = core::cmp::min(bytes.len(), user_buf.len());
+                    user_buf[..len].copy_from_slice(&bytes[..len]);
+                    ctx.regs[10] = len as u64;
+                } else { ctx.regs[10] = (-1isize) as u64; }
+            }
+        },        
+        EXEC => {
+            // [修正] 包裹 unsafe
+            unsafe {
+                let elf_data = core::slice::from_raw_parts(a0 as *const u8, a1 as usize);
+                let argv_ptr = a2 as *const &str;
+                let argc = a3 as usize;
+                let argv_slice = core::slice::from_raw_parts(argv_ptr, argc);
+
+                println!("[Kernel] Spawning process with {} args...", argc);
+
+                let new_table = new_user_page_table();
+                if new_table.is_null() { ctx.regs[10] = (-1isize) as u64; }
+                else {
+                    if let Some(entry) = elf::load_elf(elf_data, &mut *new_table) {
+                        println!("[Kernel] ELF loaded.");
+                        
+                        let stack_frame = frame::alloc_frame();
+                        let stack_vaddr = 0xF000_0000;
+                        page_table::map(&mut *new_table, stack_vaddr, stack_frame, PTE_U | PTE_R | PTE_W);
+
+                        // Push Args logic
+                        let stack_top_paddr = stack_frame + 4096;
+                        let mut sp_paddr = stack_top_paddr;
+                        let mut str_vaddrs = Vec::new();
+                        
+                        for arg in argv_slice {
+                            let bytes = arg.as_bytes();
+                            let len = bytes.len() + 1; 
+                            sp_paddr -= len;
+                            let dest = sp_paddr as *mut u8;
+                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
+                            *dest.add(bytes.len()) = 0; 
+                            str_vaddrs.push(stack_vaddr + (sp_paddr - stack_frame));
+                        }
+                        sp_paddr -= sp_paddr % 8;
+                        sp_paddr -= (str_vaddrs.len() + 1) * 8; 
+                        let argv_vaddr = stack_vaddr + (sp_paddr - stack_frame);
+                        let ptr_array = sp_paddr as *mut usize;
+                        for (i, vaddr) in str_vaddrs.iter().enumerate() {
+                            *ptr_array.add(i) = *vaddr;
+                        }
+                        *ptr_array.add(str_vaddrs.len()) = 0; 
+                        let sp_vaddr = stack_vaddr + (sp_paddr - stack_frame);
+
+                        let scheduler = task::get_scheduler();
+                        let new_pid = scheduler.tasks.len();
+                        let mut new_task = Task::new_user(new_pid);
+                        new_task.root_ppn = (new_table as usize) >> 12;
+                        new_task.context.mepc = entry;
+                        new_task.context.regs[2] = sp_vaddr as u64;
+                        new_task.context.regs[10] = argc as u64;
+                        new_task.context.regs[11] = argv_vaddr as u64;
+
+                        scheduler.spawn(new_task);
+                        println!("[Kernel] Process spawned with PID {}", new_pid);
+                        ctx.regs[10] = new_pid as u64;
+                    } else { ctx.regs[10] = (-1isize) as u64; }
+                }
+            }
+        },
+        
+        DISK_READ => {
+            let sector = a0;
+            let buf_ptr = a1 as *mut u8;
+            let data = crate::virtio::read_disk(sector);
+            // [修正] 包裹 unsafe
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, 512);
+            }
+        },
+
+        EXIT => {
+            println!("[Kernel] Process exited code: {}", a0);
+            let scheduler = task::get_scheduler();
+            if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
+            
+            // Switch back to Shell
+            scheduler.current_index = 0;
+            let shell_task = &mut scheduler.tasks[0];
+            // [修正] 包裹 unsafe
+            unsafe {
+                let kernel_root = KERNEL_PAGE_TABLE as usize;
+                core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
+            }
+            return &mut shell_task.context;
+        },
+        _ => println!("Unknown Syscall: {}", id),
+    }
+    
+    ctx.mepc += 4;
+    ctx
+}-e 
+
+=== FILE: ./eos1/src/task.rs ===
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use alloc::vec; // 引入 vec! 巨集
+use crate::mm::page_table::KERNEL_PAGE_TABLE;
+
+// 堆疊大小 16KB
+pub const STACK_SIZE: usize = 16384;
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone)]
+pub struct Context {
+    pub regs: [u64; 32], 
+    pub mepc: u64,       
+}
+
+impl Context {
+    pub const fn empty() -> Self {
+        Self { regs: [0; 32], mepc: 0 }
+    }
+}
+
+#[repr(C, align(16))]
+pub struct Task {
+    #[allow(dead_code)] // 消除 id 未讀取警告
+    pub id: usize,
+    #[allow(dead_code)] // 消除 stack 未讀取警告
+    pub stack: Vec<u8>, 
+    pub context: Context,
+    pub root_ppn: usize,
+}
+
+impl Task {
+    pub fn new_kernel(id: usize, entry: extern "C" fn() -> !) -> Self {
+        // 直接在 Heap 上分配堆疊空間
+        let stack = vec![0u8; STACK_SIZE];
+        
+        // 計算堆疊頂端 (注意 Vec 的記憶體位址)
+        let stack_top = stack.as_ptr() as usize + STACK_SIZE;
+        // 確保 16-byte 對齊 (RISC-V 要求)
+        let aligned_sp = stack_top & !0xF;
+
+        let mut task = Self {
+            id,
+            stack, // 轉移所有權給 Task 結構
+            context: Context::empty(),
+            root_ppn: 0,
+        };
+        
+        task.context.regs[2] = aligned_sp as u64;
+        task.context.mepc = entry as u64;
+        
+        task
+    }
+
+    pub fn new_user(id: usize) -> Self {
+        // User Task 也需要一個 Kernel Stack (用於 Trap)
+        let stack = vec![0u8; STACK_SIZE];
+        
+        Self {
+            id,
+            stack,
+            context: Context::empty(),
+            root_ppn: 0,
+        }
+    }
+}
+
+pub struct Scheduler {
+    pub tasks: Vec<Box<Task>>,
+    pub current_index: usize,
+}
+
+pub static mut SCHEDULER: Option<Scheduler> = None;
+
+impl Scheduler {
+    pub fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            current_index: 0,
+        }
+    }
+
+    pub fn init() {
+        unsafe {
+            SCHEDULER = Some(Self::new());
+        }
+    }
+
+    pub fn spawn(&mut self, t: Task) {
+        self.tasks.push(Box::new(t));
+    }
+
+    pub unsafe fn schedule(&mut self) -> *mut Context {
+        if self.tasks.is_empty() {
+            panic!("No tasks to schedule!");
+        }
+
+        self.current_index = (self.current_index + 1) % self.tasks.len();
+        
+        let next_task = &mut self.tasks[self.current_index];
+
+        let satp_val = if next_task.root_ppn != 0 {
+            (8 << 60) | next_task.root_ppn
+        } else {
+            let kernel_root = unsafe { KERNEL_PAGE_TABLE as usize };
+            (8 << 60) | (kernel_root >> 12)
+        };
+        
+        unsafe {
+            core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) satp_val);
+        }
+
+        &mut next_task.context as *mut Context
+    }
+
+    #[allow(dead_code)]
+    pub fn current_task(&mut self) -> &mut Task {
+        &mut self.tasks[self.current_index]
+    }
+}
+
+pub fn get_scheduler() -> &'static mut Scheduler {
+    unsafe {
+        let ptr = &raw mut SCHEDULER;
+        (*ptr).as_mut().unwrap()
+    }
+}-e 
+
+=== FILE: ./eos1/src/timer.rs ===
+const CLINT_MTIMECMP: *mut u64 = 0x0200_4000 as *mut u64;
+const CLINT_MTIME: *const u64 = 0x0200_BFF8 as *const u64;
+const INTERVAL: u64 = 1_000_000;
+
+pub fn set_next() {
+    unsafe {
+        let now = CLINT_MTIME.read_volatile();
+        CLINT_MTIMECMP.write_volatile(now + INTERVAL);
+    }
+}-e 
+
+=== FILE: ./eos1/src/trap.rs ===
+use crate::task::{self, Context};
+use crate::syscall;
+use crate::timer;
+use crate::plic;
+use crate::mm::page_table::KERNEL_PAGE_TABLE;
+use crate::shell; // 稍後我們會把 shell 移出去
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_timer(_ctx_ptr: *mut Context) -> *mut Context {
+    timer::set_next();
+    let scheduler = task::get_scheduler();
+    unsafe { scheduler.schedule() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_external(ctx_ptr: *mut Context) -> *mut Context {
+    plic::handle_interrupt();
+    ctx_ptr
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_trap(ctx_ptr: *mut Context) -> *mut Context {
+    let mcause: usize;
+    unsafe { core::arch::asm!("csrr {}, mcause", out(reg) mcause); }
+    
+    let is_interrupt = (mcause >> 63) != 0;
+    let code = mcause & 0xfff;
+
+    if is_interrupt {
+        println!("[Kernel] Unexpected interrupt: {}", code);
+        return ctx_ptr;
+    } else {
+        if code == 8 { 
+            // 轉發給 syscall dispatcher
+            return unsafe { syscall::dispatcher(&mut *ctx_ptr) };
+        }
+        
+        // Crash Handling
+        let mtval: usize;
+        unsafe { core::arch::asm!("csrr {}, mtval", out(reg) mtval); }
+        println!("\n[Crash] mcause={}, mepc={:x}, mtval={:x}", code, unsafe { (*ctx_ptr).mepc }, mtval);
+        println!("User App crashed. Rebooting shell...");
+        
+        unsafe {
+            // 重置為核心頁表
+            let kernel_root = KERNEL_PAGE_TABLE as usize;
+            core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) (8 << 60) | (kernel_root >> 12));
+            
+            // 清理任務
+            let scheduler = task::get_scheduler();
+            if scheduler.tasks.len() > 2 { scheduler.tasks.truncate(2); }
+            scheduler.current_index = 0;
+            let shell_task = &mut scheduler.tasks[0];
+            
+            shell_task.root_ppn = 0;
+            // 指向 Shell 入口
+            shell_task.context.mepc = shell::shell_entry as u64;
+            
+            // 重置 mstatus
+            let mut mstatus: usize;
+            core::arch::asm!("csrr {}, mstatus", out(reg) mstatus);
+            mstatus &= !(3 << 11); mstatus |= 1 << 7;
+            core::arch::asm!("csrw mstatus, {}", in(reg) mstatus);
+            
+            return &mut shell_task.context;
+        }
+    }
+}-e 
+
+=== FILE: ./eos1/src/uart.rs ===
+use core::fmt;
+
+pub struct Uart {
+    base_address: usize,
+}
+
+impl Uart {
+    pub const fn new(addr: usize) -> Self {
+        Self {
+            base_address: addr,
+        }
+    }
+
+    /// 寫入一個字元
+    pub fn putc(&self, c: u8) {
+        let ptr = self.base_address as *mut u8;
+        unsafe {
+            ptr.add(0).write_volatile(c);
+        }
+    }
+
+    /// 讀取一個字元 (非阻塞)
+    /// 如果有字元，回傳 Some(c)，否則回傳 None
+    pub fn getc(&self) -> Option<u8> {
+        let ptr = self.base_address as *mut u8;
+        unsafe {
+            // 讀取 LSR (Line Status Register, offset 5)
+            // Bit 0 為 1 代表有資料可讀
+            if ptr.add(5).read_volatile() & 1 == 0 {
+                None
+            } else {
+                // 讀取 RBR (Receiver Buffer Register, offset 0)
+                Some(ptr.add(0).read_volatile())
+            }
+        }
+    }
+
+
+    pub fn enable_interrupt(&self) {
+        let ptr = self.base_address as *mut u8;
+        unsafe {
+            // IER (Interrupt Enable Register) 是在 offset 1
+            // 寫入 1 代表開啟 "接收資料" 中斷
+            ptr.add(1).write_volatile(1);
+        }
+    }
+}
+
+impl fmt::Write for Uart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            self.putc(byte);
+        }
+        Ok(())
+    }
+}
+
+// 建立全域的 UART 實例
+pub static mut WRITER: Uart = Uart::new(0x1000_0000);
+
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    unsafe {
+        let writer_ptr = &raw mut WRITER;
+        (*writer_ptr).write_fmt(args).unwrap();
+    }
+}
+
+// 供核心呼叫的讀取函式
+pub fn _getchar() -> Option<u8> {
+    unsafe {
+        let writer_ptr = &raw mut WRITER;
+        (*writer_ptr).getc()
+    }
+}
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::uart::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}-e 
+
+=== FILE: ./eos1/src/virtio.rs ===
+use crate::mm::frame::alloc_frame;
+use core::mem::size_of;
+
+// --- VirtIO MMIO 暫存器偏移量 ---
+const VIRTIO0: usize = 0x1000_1000;
+const MAGIC: usize = 0x000;
+const VERSION: usize = 0x004;
+const DEVICE_ID: usize = 0x008;
+const DEVICE_FEATURES: usize = 0x010;
+const DRIVER_FEATURES: usize = 0x020;
+const GUEST_PAGE_SIZE: usize = 0x028;
+const QUEUE_SEL: usize = 0x030;
+const QUEUE_NUM_MAX: usize = 0x034;
+const QUEUE_NUM: usize = 0x038;
+const QUEUE_PFN: usize = 0x040;
+const QUEUE_NOTIFY: usize = 0x050;
+const STATUS: usize = 0x070;
+
+// --- VirtIO 狀態位元 ---
+const STATUS_ACKNOWLEDGE: u32 = 1;
+const STATUS_DRIVER: u32 = 2;
+const STATUS_FEATURES_OK: u32 = 8;
+const STATUS_DRIVER_OK: u32 = 4;
+
+
+// --- Virtqueue 結構 ---
+#[repr(C)]
+struct VirtqDesc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+#[repr(C)]
+struct VirtqAvail {
+    flags: u16,
+    idx: u16,
+    ring: [u16; 32],
+    #[allow(dead_code)]
+    used_event: u16,
+}
+
+#[repr(C)]
+struct VirtqUsedElem {
+    #[allow(dead_code)]
+    id: u32,
+    #[allow(dead_code)]
+    len: u32,
+}
+
+#[repr(C)]
+struct VirtqUsed {
+    #[allow(dead_code)]
+    flags: u16,
+    idx: u16,
+    #[allow(dead_code)]
+    ring: [VirtqUsedElem; 32],
+    #[allow(dead_code)]
+    avail_event: u16,
+}
+
+// --- Driver 狀態 ---
+static mut QUEUE_PAGE: usize = 0;
+static mut USED_IDX: u16 = 0;
+
+// Flags & Types
+const VRING_DESC_F_NEXT: u16 = 1;
+const VRING_DESC_F_WRITE: u16 = 2;
+const VIRTIO_BLK_T_IN: u32 = 0;  // Read
+const VIRTIO_BLK_T_OUT: u32 = 1; // Write
+
+#[repr(C)]
+struct VirtioBlkReq {
+    type_: u32,
+    reserved: u32,
+    sector: u64,
+}
+
+/// 初始化 VirtIO 驅動
+pub fn init() {
+    unsafe {
+        let base = VIRTIO0 as *mut u32;
+        
+        if base.add(MAGIC / 4).read_volatile() != 0x74726976 { panic!("VirtIO magic mismatch"); }
+        if base.add(VERSION / 4).read_volatile() != 1 { panic!("VirtIO version mismatch"); }
+        if base.add(DEVICE_ID / 4).read_volatile() != 2 { panic!("Not a block device"); }
+
+        base.add(STATUS / 4).write_volatile(0); // Reset
+
+        let mut status = STATUS_ACKNOWLEDGE | STATUS_DRIVER;
+        base.add(STATUS / 4).write_volatile(status);
+
+        let _features = base.add(DEVICE_FEATURES / 4).read_volatile();
+        base.add(DRIVER_FEATURES / 4).write_volatile(0);
+        
+        status |= STATUS_FEATURES_OK;
+        base.add(STATUS / 4).write_volatile(status);
+
+        base.add(QUEUE_SEL / 4).write_volatile(0);
+        
+        let max = base.add(QUEUE_NUM_MAX / 4).read_volatile();
+        if max == 0 { panic!("VirtIO queue max is 0"); }
+
+        base.add(QUEUE_NUM / 4).write_volatile(32);
+
+        // 分配兩頁以確保空間足夠
+        let page1 = alloc_frame();
+        let _page2 = alloc_frame(); 
+        if page1 == 0 { panic!("VirtIO OOM"); }
+        QUEUE_PAGE = page1;
+        
+        base.add(GUEST_PAGE_SIZE / 4).write_volatile(4096);
+        base.add(QUEUE_PFN / 4).write_volatile((page1 >> 12) as u32);
+
+        status |= STATUS_DRIVER_OK;
+        base.add(STATUS / 4).write_volatile(status);
+    }
+}
+
+/// 讀取磁碟的一個 Sector (512 bytes)
+pub fn read_disk(sector: u64) -> [u8; 512] {
+    let buffer = [0u8; 512];
+    
+    unsafe {
+        let base = VIRTIO0 as *mut u32;
+        let desc_table = QUEUE_PAGE as *mut VirtqDesc;
+        let avail_ring = (QUEUE_PAGE + 512) as *mut VirtqAvail;
+        let used_ring = (QUEUE_PAGE + 4096) as *mut VirtqUsed;
+
+        // 1. Request Header
+        static mut REQ: VirtioBlkReq = VirtioBlkReq {
+            type_: VIRTIO_BLK_T_IN,
+            reserved: 0,
+            sector: 0,
+        };
+        REQ.sector = sector;
+
+        // 2. Status Byte
+        static mut STATUS_BYTE: u8 = 255;
+        STATUS_BYTE = 255;
+
+        // 3. Fill Descriptors
+        // Desc 0: Header
+        (*desc_table.add(0)).addr = &raw mut REQ as u64;
+        (*desc_table.add(0)).len = size_of::<VirtioBlkReq>() as u32;
+        (*desc_table.add(0)).flags = VRING_DESC_F_NEXT;
+        (*desc_table.add(0)).next = 1;
+
+        // Desc 1: Buffer (Write-only for device)
+        (*desc_table.add(1)).addr = buffer.as_ptr() as u64;
+        (*desc_table.add(1)).len = 512;
+        (*desc_table.add(1)).flags = VRING_DESC_F_NEXT | VRING_DESC_F_WRITE;
+        (*desc_table.add(1)).next = 2;
+
+        // Desc 2: Status (Write-only for device)
+        (*desc_table.add(2)).addr = &raw mut STATUS_BYTE as u64;
+        (*desc_table.add(2)).len = 1;
+        (*desc_table.add(2)).flags = VRING_DESC_F_WRITE;
+        (*desc_table.add(2)).next = 0;
+
+        // 4. Update Available Ring
+        let idx = (*avail_ring).idx as usize;
+        (*avail_ring).ring[idx % 32] = 0; // Head Index
+        
+        core::arch::asm!("fence");
+        (*avail_ring).idx = (*avail_ring).idx.wrapping_add(1);
+
+        // 5. Notify Device
+        base.add(QUEUE_NOTIFY / 4).write_volatile(0);
+
+        // 6. Wait for completion (Spinning)
+        while (*used_ring).idx == USED_IDX {
+            core::arch::asm!("nop");
+        }
+        USED_IDX = (*used_ring).idx;
+    }
+
+    buffer
+}
+
+// [新增] 寫入磁碟的一個 Sector (512 bytes)
+pub fn write_disk(sector: u64, data: &[u8]) {
+    if data.len() != 512 { panic!("Write size must be 512 bytes"); }
+
+    unsafe {
+        let base = VIRTIO0 as *mut u32;
+        let desc_table = QUEUE_PAGE as *mut VirtqDesc;
+        let avail_ring = (QUEUE_PAGE + 512) as *mut VirtqAvail;
+        let used_ring = (QUEUE_PAGE + 4096) as *mut VirtqUsed;
+
+        // 1. Request Header
+        static mut REQ_WRITE: VirtioBlkReq = VirtioBlkReq {
+            type_: VIRTIO_BLK_T_OUT, // 注意：這裡是 OUT
+            reserved: 0,
+            sector: 0,
+        };
+        REQ_WRITE.sector = sector;
+
+        // 2. Status Byte
+        static mut STATUS_BYTE_WRITE: u8 = 255;
+        STATUS_BYTE_WRITE = 255;
+
+        // 3. Fill Descriptors
+        // Desc 0: Header (Read-only for device)
+        (*desc_table.add(0)).addr = &raw mut REQ_WRITE as u64;
+        (*desc_table.add(0)).len = size_of::<VirtioBlkReq>() as u32;
+        (*desc_table.add(0)).flags = VRING_DESC_F_NEXT;
+        (*desc_table.add(0)).next = 1;
+
+        // Desc 1: Buffer (Read-only for device -> Device reads from RAM to Disk)
+        // [關鍵差異] 這裡 *不要* 加 VRING_DESC_F_WRITE，因為是裝置要讀資料
+        (*desc_table.add(1)).addr = data.as_ptr() as u64;
+        (*desc_table.add(1)).len = 512;
+        (*desc_table.add(1)).flags = VRING_DESC_F_NEXT; // 沒有 WRITE flag
+        (*desc_table.add(1)).next = 2;
+
+        // Desc 2: Status (Write-only for device)
+        (*desc_table.add(2)).addr = &raw mut STATUS_BYTE_WRITE as u64;
+        (*desc_table.add(2)).len = 1;
+        (*desc_table.add(2)).flags = VRING_DESC_F_WRITE;
+        (*desc_table.add(2)).next = 0;
+
+        // 4. Update Available Ring
+        let idx = (*avail_ring).idx as usize;
+        (*avail_ring).ring[idx % 32] = 0; // Head Index
+        
+        core::arch::asm!("fence");
+        (*avail_ring).idx = (*avail_ring).idx.wrapping_add(1);
+
+        // 5. Notify Device
+        base.add(QUEUE_NOTIFY / 4).write_volatile(0);
+
+        // 6. Wait for completion
+        while (*used_ring).idx == USED_IDX {
+            core::arch::asm!("nop");
+        }
+        USED_IDX = (*used_ring).idx;
+    }
+}
+-e 
+
+=== FILE: ./mkfs/src/main.rs ===
+use std::fs;
+use std::fs::File;
+use std::io::{Read, Write, Seek, SeekFrom};
+use std::mem::size_of;
+use std::path::Path;
+
+const SOURCE_DIR: &str = "fs_root";
+const TARGET_IMG: &str = "disk.img";
+const DISK_SIZE: u64 = 32 * 1024 * 1024;
+
+// 0=File, 1=Directory
+const TYPE_FILE: u8 = 0;
+const TYPE_DIR: u8 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Superblock {
+    magic: u32,
+    file_count: u32, // Root dir file count
+    _padding: [u8; 504],
+}
+
+impl Default for Superblock {
+    fn default() -> Self {
+        Self { magic: 0, file_count: 0, _padding: [0; 504] }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DirEntry {
+    name: [u8; 32],
+    start_sector: u32,
+    size: u32,
+    file_type: u8,      // [新增] 類型
+    _padding: [u8; 23], // [修改] 剩餘填充
+}
+
+impl Default for DirEntry {
+    fn default() -> Self {
+        Self { name: [0; 32], start_sector: 0, size: 0, file_type: 0, _padding: [0; 23] }
+    }
+}
+
+// 全域變數：追蹤目前寫到哪個 Sector
+static mut CURRENT_SECTOR: u32 = 10;
+
+fn main() -> std::io::Result<()> {
+    println!("--- SimpleFS Recursive Packer ---");
+
+    // 1. 初始化磁碟
+    let mut disk = File::create(TARGET_IMG)?;
+    disk.set_len(DISK_SIZE)?;
+
+    // 2. 遞迴處理根目錄，取得根目錄的內容 (Byte Array)
+    // 根目錄的內容其實就是 Directory Table
+    let (root_entries_bytes, file_count) = process_directory(Path::new(SOURCE_DIR), &mut disk)?;
+
+    // 3. 寫入 Superblock (Sector 0)
+    let mut sb = Superblock::default();
+    sb.magic = 0x53465331;
+    sb.file_count = file_count;
+    
+    let sb_bytes = unsafe {
+        std::slice::from_raw_parts(&sb as *const _ as *const u8, size_of::<Superblock>())
+    };
+    disk.seek(SeekFrom::Start(0))?;
+    disk.write_all(sb_bytes)?;
+
+    // 4. 寫入 Root Directory Table (Sector 1)
+    // 注意：SimpleFS 規定 Sector 1 是根目錄表
+    disk.seek(SeekFrom::Start(512))?;
+    if root_entries_bytes.len() > 512 {
+        panic!("Root directory too large (> 8 files)!");
+    }
+    disk.write_all(&root_entries_bytes)?;
+
+    println!("Done! Created {}", TARGET_IMG);
+    Ok(())
+}
+
+// 遞迴函數：處理一個資料夾，回傳該資料夾的 Directory Table (bytes) 和檔案數
+fn process_directory(dir_path: &Path, disk: &mut File) -> std::io::Result<(Vec<u8>, u32)> {
+    let mut entries = Vec::new();
+    let mut count = 0;
+
+    let paths = fs::read_dir(dir_path)?;
+
+    for entry in paths {
+        let entry = entry?;
+        let path = entry.path();
+        let name_str = path.file_name().unwrap().to_str().unwrap();
+        
+        // 忽略隱藏檔
+        if name_str.starts_with('.') { continue; }
+
+        let mut dir_entry = DirEntry::default();
+        
+        // 複製檔名
+        let name_bytes = name_str.as_bytes();
+        if name_bytes.len() > 32 { panic!("Name too long: {}", name_str); }
+        dir_entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+        if path.is_dir() {
+            println!("Packing DIR : {}", name_str);
+            // [遞迴] 處理子目錄
+            // 子目錄的「內容」就是它裡面的 Directory Table
+            let (subdir_table_bytes, _) = process_directory(&path, disk)?;
+            
+            // 將這個 Table 寫入 Data Area，就像寫普通檔案一樣
+            let start_sec = unsafe { CURRENT_SECTOR };
+            let size = subdir_table_bytes.len() as u32;
+            
+            disk.seek(SeekFrom::Start(start_sec as u64 * 512))?;
+            disk.write_all(&subdir_table_bytes)?;
+            
+            // 計算佔用 Sector
+            let sectors = (size + 511) / 512;
+            unsafe { CURRENT_SECTOR += sectors; }
+
+            dir_entry.file_type = TYPE_DIR;
+            dir_entry.start_sector = start_sec;
+            dir_entry.size = size;
+
+        } else {
+            println!("Packing FILE: {}", name_str);
+            // 處理普通檔案
+            let mut file = File::open(&path)?;
+            let mut content = Vec::new();
+            file.read_to_end(&mut content)?;
+
+            let start_sec = unsafe { CURRENT_SECTOR };
+            let size = content.len() as u32;
+
+            disk.seek(SeekFrom::Start(start_sec as u64 * 512))?;
+            disk.write_all(&content)?;
+
+            let sectors = (size + 511) / 512;
+            unsafe { CURRENT_SECTOR += sectors; }
+
+            dir_entry.file_type = TYPE_FILE;
+            dir_entry.start_sector = start_sec;
+            dir_entry.size = size;
+        }
+
+        entries.push(dir_entry);
+        count += 1;
+    }
+
+    // 將 entries 序列化成 bytes
+    let mut table_bytes = Vec::new();
+    for e in entries {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&e as *const _ as *const u8, size_of::<DirEntry>())
+        };
+        table_bytes.extend_from_slice(bytes);
+    }
+    
+    // 補齊到 512 bytes (一個 Sector) 的倍數 (Optional, 視需求)
+    // 這裡我們不補齊，直接回傳實際大小，讓上層決定怎麼寫
+    
+    Ok((table_bytes, count))
+}-e 
+
+=== FILE: ./user_app/src/bin/cat.rs ===
+#![no_std]
+#![no_main]
+#[macro_use] extern crate ulib;
+
+fn main(args: &[*const u8]) -> i32 {
+    if args.len() < 2 {
+        println!("Usage: cat <file>");
+        return 1;
+    }
+    // 解析檔名 (args[1])
+    let filename = unsafe {
+        let ptr = args[1];
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        let slice = core::slice::from_raw_parts(ptr, len);
+        core::str::from_utf8(slice).unwrap_or("")
+    };
+
+    let f_len = ulib::sys_file_len(filename);
+    if f_len < 0 {
+        println!("File not found.");
+        return 1;
+    }
+
+    let mut buf = [0u8; 512]; 
+    let read_len = ulib::sys_file_read(filename, &mut buf);
+    if read_len > 0 {
+        if let Ok(s) = core::str::from_utf8(&buf[0..read_len as usize]) {
+            println!("{}", s);
+        } else {
+            println!("(Binary file)");
+        }
+    }
+    0
+}
+entry_point!(main);-e 
+
+=== FILE: ./user_app/src/bin/hello.rs ===
+#![no_std]
+#![no_main]
+
+#[macro_use]
+extern crate ulib;
+
+fn main(_args: &[*const u8]) -> i32 {
+    println!("Hello from the Unified Project!");
+    0
+}
+
+entry_point!(main);-e 
+
+=== FILE: ./user_app/src/bin/ls.rs ===
+#![no_std]
+#![no_main]
+#[macro_use] extern crate ulib;
+
+fn main(_args: &[*const u8]) -> i32 {
+    let mut idx = 0;
+    let mut buf = [0u8; 32];
+    loop {
+        let len = ulib::sys_file_list(idx, &mut buf);
+        if len < 0 { break; }
+        let name = core::str::from_utf8(&buf[0..len as usize]).unwrap_or("???");
+        println!(" - {}", name);
+        idx += 1;
+    }
+    0
+}
+entry_point!(main);-e 
+
+=== FILE: ./user_app/src/bin/program.rs ===
+#![no_std]
+#![no_main]
+#[macro_use] extern crate ulib;
+
+fn main(args: &[*const u8]) -> i32 {
+    println!("[User] Hello from program!");
+    println!("[User] argc = {}", args.len());
+    
+    // 解析第一個參數 (程式名稱)
+    if args.len() > 0 {
+        let name = unsafe {
+            let ptr = args[0];
+            let mut len = 0;
+            while *ptr.add(len) != 0 { len += 1; }
+            let slice = core::slice::from_raw_parts(ptr, len);
+            core::str::from_utf8(slice).unwrap_or("?")
+        };
+        println!("[User] My name is: {}", name);
+    }
+    0
+}
+entry_point!(main);-e 
+
+=== FILE: ./user_app/src/lib.rs ===
+#![no_std]
+// [修正] 移除 #![feature(panic_info_message)]，因為它已經穩定了，不需要再宣告
+
+use core::fmt;
+
+// --- System Call ID (必須與 Kernel 一致) ---
+pub const SYSCALL_PUTCHAR: u64 = 1;
+pub const SYSCALL_GETCHAR: u64 = 2;
+pub const SYSCALL_FILE_LEN: u64 = 3;
+pub const SYSCALL_FILE_READ: u64 = 4;
+pub const SYSCALL_FILE_LIST: u64 = 5;
+pub const SYSCALL_EXEC: u64 = 6;
+pub const SYSCALL_DISK_READ: u64 = 7;
+pub const SYSCALL_FILE_WRITE: u64 = 8;
+pub const SYSCALL_EXIT: u64 = 93;
+
+// --- Wrappers ---
+
+pub fn sys_putchar(c: u8) {
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_PUTCHAR, in("a0") c); }
+}
+
+pub fn sys_exit(code: i32) -> ! {
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_EXIT, in("a0") code); }
+    loop {}
+}
+
+pub fn sys_file_len(name: &str) -> isize {
+    let mut ret: isize;
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_LEN, in("a0") name.as_ptr(), in("a1") name.len(), lateout("a0") ret); }
+    ret
+}
+
+pub fn sys_file_read(name: &str, buf: &mut [u8]) -> isize {
+    let mut ret: isize;
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_READ, in("a0") name.as_ptr(), in("a1") name.len(), in("a2") buf.as_mut_ptr(), in("a3") buf.len(), lateout("a0") ret); }
+    ret
+}
+
+pub fn sys_file_list(index: usize, buf: &mut [u8]) -> isize {
+    let mut ret: isize;
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_FILE_LIST, in("a0") index, in("a1") buf.as_mut_ptr(), in("a2") buf.len(), lateout("a0") ret); }
+    ret
+}
+
+// --- Println ---
+
+pub struct Console;
+impl fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.bytes() { sys_putchar(c); }
+        Ok(())
+    }
+}
+
+pub fn _print(args: fmt::Arguments) {
+    use fmt::Write;
+    let mut out = Console;
+    out.write_fmt(args).unwrap();
+}
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+// --- Entry Point Macro ---
+
+#[macro_export]
+macro_rules! entry_point {
+    ($path:path) => {
+        #[unsafe(no_mangle)]
+        #[unsafe(link_section = ".text.entry")]
+        pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
+            let args: &[*const u8] = unsafe { 
+                if argv.is_null() { &[] } 
+                else { core::slice::from_raw_parts(argv, argc) }
+            };
+            
+            let code = $path(args);
+            
+            $crate::sys_exit(code);
+        }
+
+        #[panic_handler]
+        fn panic(info: &core::panic::PanicInfo) -> ! {
+            $crate::println!("\n[User Panic]");
+            // 在 Stable Rust 1.81+，可以直接印出 info
+            $crate::println!("{}", info);
+            $crate::sys_exit(-1);
+        }
+    };
+}-e 
+
+=== FILE: ./user_app/src/main.rs ===
+#![no_std]
+#![no_main]
+
+use core::panic::PanicInfo;
+
+const SYSCALL_PUTCHAR: u64 = 1;
+const SYSCALL_EXIT: u64 = 93;
+
+fn sys_putchar(c: u8) {
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_PUTCHAR, in("a0") c); }
+}
+
+fn sys_exit(code: i32) -> ! {
+    unsafe { core::arch::asm!("ecall", in("a7") SYSCALL_EXIT, in("a0") code); }
+    loop {}
+}
+
+struct Console;
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for c in s.bytes() { sys_putchar(c); }
+        Ok(())
+    }
+}
+
+// [修正] 增加 argc 和 argv 參數
+// 根據 RISC-V 呼叫慣例：
+// a0 = argc (usize)
+// a1 = argv (*const *const u8) -> 指向字串指標陣列的指標
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.entry")]
+pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
+    use core::fmt::Write;
+    let mut out = Console;
+
+    let _ = write!(out, "\n[UserApp] Started!\n");
+    let _ = write!(out, "[UserApp] argc = {}\n", argc);
+
+    // 遍歷並印出所有參數
+    for i in 0..argc {
+        unsafe {
+            // 1. 取得第 i 個字串的指標 (argv[i])
+            let str_ptr = *argv.add(i);
+            
+            // 2. 計算字串長度 (尋找 \0)
+            let mut len = 0;
+            while *str_ptr.add(len) != 0 {
+                len += 1;
+            }
+
+            // 3. 轉成 Rust slice 並印出
+            let slice = core::slice::from_raw_parts(str_ptr, len);
+            let s = core::str::from_utf8(slice).unwrap_or("<?>");
+            let _ = write!(out, "[UserApp] argv[{}] = \"{}\"\n", i, s);
+        }
+    }
+
+    sys_exit(0);
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! { loop {} }-e 
+

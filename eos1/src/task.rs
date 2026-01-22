@@ -1,6 +1,7 @@
+// === FILE: ./eos1/src/task.rs ===
 use alloc::vec::Vec;
 use alloc::boxed::Box;
-use alloc::vec; // 引入 vec! 巨集
+use alloc::vec;
 use crate::mm::page_table::KERNEL_PAGE_TABLE;
 
 // 堆疊大小 16KB
@@ -21,27 +22,24 @@ impl Context {
 
 #[repr(C, align(16))]
 pub struct Task {
-    #[allow(dead_code)] // 消除 id 未讀取警告
+    #[allow(dead_code)]
     pub id: usize,
-    #[allow(dead_code)] // 消除 stack 未讀取警告
+    #[allow(dead_code)]
     pub stack: Vec<u8>, 
     pub context: Context,
     pub root_ppn: usize,
+    // [移除] files
 }
 
 impl Task {
     pub fn new_kernel(id: usize, entry: extern "C" fn() -> !) -> Self {
-        // 直接在 Heap 上分配堆疊空間
         let stack = vec![0u8; STACK_SIZE];
-        
-        // 計算堆疊頂端 (注意 Vec 的記憶體位址)
         let stack_top = stack.as_ptr() as usize + STACK_SIZE;
-        // 確保 16-byte 對齊 (RISC-V 要求)
         let aligned_sp = stack_top & !0xF;
 
         let mut task = Self {
             id,
-            stack, // 轉移所有權給 Task 結構
+            stack,
             context: Context::empty(),
             root_ppn: 0,
         };
@@ -52,8 +50,8 @@ impl Task {
         task
     }
 
+    // [還原] 移除 parent_files 參數
     pub fn new_user(id: usize) -> Self {
-        // User Task 也需要一個 Kernel Stack (用於 Trap)
         let stack = vec![0u8; STACK_SIZE];
         
         Self {
@@ -113,7 +111,6 @@ impl Scheduler {
         &mut next_task.context as *mut Context
     }
 
-    #[allow(dead_code)]
     pub fn current_task(&mut self) -> &mut Task {
         &mut self.tasks[self.current_index]
     }
